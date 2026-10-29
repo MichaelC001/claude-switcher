@@ -1,10 +1,10 @@
 ﻿# Claude 账号切换器 - Windows 核心脚本
-# 用法: powershell -NoProfile -File claude-switch.ps1 check|status|switch A|B|checkdetail|fix|set-region|check-update|update-now
+# 用法: powershell -NoProfile -File claude-switch.ps1 check|checkdetail|status|switch A|B|C|D|fix|set-region|set-client|check-update|update-now
 $ErrorActionPreference = 'Continue'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
 # ============ 安装时可配置项(安装器自动改写) ============
-$PROXY_MODE = "clash-verge"            # 代理客户端: clash-verge|sing-box|clashx|surge|wireguard|other|auto
+$PROXY_MODE = "clash-verge"            # 代理客户端: clash-verge|flclash|sing-box|clashx|surge|wireguard|other|auto
 $COUNTRY_TARGET = "US"                 # 目标出口国家(安装时按出口自动识别)
 $TZ_TARGET = "Eastern Standard Time"   # Windows 时区ID
 $LOCALE_TARGET = "en-US"               # 地区格式目标(安装/set-region 自动写入)
@@ -22,8 +22,8 @@ $CLASH_DIR = @(
     (Join-Path $env:LOCALAPPDATA "io.github.clash-verge-rev.clash-verge-rev")
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $CLASH_DIR) { $CLASH_DIR = Join-Path $env:APPDATA "io.github.clash-verge-rev.clash-verge-rev" }
-# check-update / rules-status 必须只读:不在检查路径上创建任何目录
-if ($args.Count -eq 0 -or ($args[0] -ne 'check-update' -and $args[0] -ne 'rules-status')) {
+# check-update / rules-status / diagnose-proxy 必须只读:不在检查路径上创建任何目录
+if ($args.Count -eq 0 -or ($args[0] -ne 'check-update' -and $args[0] -ne 'rules-status' -and $args[0] -ne 'diagnose-proxy')) {
     New-Item -ItemType Directory -Force -Path "$BASE\accounts" | Out-Null
 }
 
@@ -1582,6 +1582,276 @@ function Invoke-Switch($target) {
     "OK:已切换到账号$target"
 }
 
+function Get-Fingerprint {
+    "# 设备指纹体检 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    $hits = New-Object 'System.Collections.Generic.HashSet[string]'
+    $fontDirs = @("$env:WINDIR\Fonts", "$env:LOCALAPPDATA\Microsoft\Windows\Fonts")
+    foreach ($dir in $fontDirs) {
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+        foreach ($file in @(Get-ChildItem -LiteralPath $dir -Recurse -File -ErrorAction SilentlyContinue)) {
+            if ($file.Extension -notin @('.ttf','.ttc','.otf')) { continue }
+            $name = $file.Name.ToLowerInvariant()
+            if ($name -match 'simsun|simhei|simkai|simfang|msyh|msjh|dengxian|wqy|fzshu|fzkai|fzhei|fangsong') { [void]$hits.Add($name) }
+        }
+    }
+    if ($hits.Count) {
+        "字体=warn:检测到地区特征字体:$($hits -join ',')"
+        '建议=不需要的字体可在 Windows 字体设置中停用；系统自带字体不等于异常'
+    } else {
+        '字体=ok:未发现中文办公字体'
+    }
+    $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object -First 1
+    $gpuName = if ($gpu -and $gpu.Name) { [string]$gpu.Name } else { '未知' }
+    "GPU=ok:$gpuName"
+    $resolution = if ($gpu -and $gpu.CurrentHorizontalResolution -and $gpu.CurrentVerticalResolution) { "$($gpu.CurrentHorizontalResolution)x$($gpu.CurrentVerticalResolution)" } else { '未知' }
+    "显示=ok:$resolution"
+    $computer = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $machine = if ($computer) { "$($computer.Manufacturer) $($computer.Model)" } else { '' }
+    if ($gpuName -match 'Virtual|VMware|VirtualBox|SwiftShader|llvmpipe|Microsoft Basic' -or $machine -match 'VMware|VirtualBox|QEMU|KVM|Parallels|HVM|Hyper-V') {
+        "虚拟机=warn:检测到虚拟化特征($gpuName)"
+    } else {
+        '虚拟机=ok:未发现常见虚拟化特征'
+    }
+    'CanvasWebGL=info:请打开 Web 检测页 https://yoursjeyo.github.io/claude-switcher/ 查看 Canvas/WebGL 指纹'
+}
+
+function Invoke-ExternalCapture([string]$FilePath, [string[]]$Arguments, [int]$TimeoutMs = 5000) {
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $FilePath
+        $psi.Arguments = ConvertTo-WindowsCommandLine $Arguments
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $process = [System.Diagnostics.Process]::Start($psi)
+        if (-not $process.WaitForExit($TimeoutMs)) {
+            try { $process.Kill() } catch {}
+            return ''
+        }
+        return ($process.StandardOutput.ReadToEnd().Trim() -split "`r?`n")[0]
+    } catch { return '' }
+}
+
+function Get-CliInfo {
+    "# Claude Code CLI 体检 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    $command = Get-Command claude -ErrorAction SilentlyContinue | Select-Object -First 1
+    $path = if ($command) { [string]$command.Source } else { '' }
+    if ($path) {
+        "CLI=ok:$path"
+        $version = Invoke-ExternalCapture $path @('--version') 4000
+        "版本=ok:$(if ($version) { $version } else { '未获取' })"
+        $method = if ($path -match '\\.claude\\local|\\.local\\share\\claude') { 'native(官方安装脚本)' }
+            elseif ($path -match 'node_modules|\\.npm|\\.bun') { 'npm/bun' }
+            else { '未知(建议核对 PATH)' }
+        "安装方式=info:$method"
+    } else {
+        'CLI=warn:PATH 中没有 claude 命令'
+        '安装方式=info:未安装(桌面版可能自带内置 CLI,见下)'
+    }
+    $bundledRoot = Join-Path $DATA 'claude-code'
+    $bundled = if (Test-Path -LiteralPath $bundledRoot) { Get-ChildItem -LiteralPath $bundledRoot -Directory -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1 } else { $null }
+    if ($bundled) { "桌面版内置=ok:$($bundled.Name)" } else { '桌面版内置=info:未发现' }
+    $npm = Get-Command npm.cmd,npm -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($npm) {
+        $npmList = Invoke-ExternalCapture $npm.Source @('ls','-g','--depth=0','@anthropic-ai/claude-code') 6000
+        if ($npmList -match '@anthropic-ai/claude-code') { "npm全局包=warn:$npmList" } else { 'npm全局包=ok:未检测到' }
+    } else { 'npm全局包=ok:未检测到 npm' }
+    $config = Join-Path $env:USERPROFILE '.claude'
+    if (Test-Path -LiteralPath $config -PathType Container) {
+        $measure = Get-ChildItem -LiteralPath $config -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum
+        "配置目录=ok:$config ($(Format-AccountSize ([double]$measure.Sum)))"
+    } else { '配置目录=info:未创建(尚未运行过 CLI)' }
+    if ($path) { '建议=info:升级请使用原安装方式；卸载前先确认桌面版是否依赖它' }
+}
+
+function Quote-WindowsArgument([string]$Argument) {
+    if ($Argument.Length -eq 0) { return '""' }
+    if ($Argument -notmatch '[\s"]') { return $Argument }
+    $result = New-Object System.Text.StringBuilder
+    [void]$result.Append('"')
+    $slashes = 0
+    foreach ($char in $Argument.ToCharArray()) {
+        if ($char -eq [char]92) { $slashes++; continue }
+        if ($char -eq '"') {
+            [void]$result.Append(('\' * ($slashes * 2 + 1)))
+            [void]$result.Append('"')
+            $slashes = 0
+            continue
+        }
+        if ($slashes) { [void]$result.Append(('\' * $slashes)); $slashes = 0 }
+        [void]$result.Append($char)
+    }
+    [void]$result.Append(('\' * ($slashes * 2)))
+    [void]$result.Append('"')
+    return $result.ToString()
+}
+
+function ConvertTo-WindowsCommandLine([string[]]$Arguments) {
+    return (@($Arguments | ForEach-Object { Quote-WindowsArgument ([string]$_) }) -join ' ')
+}
+
+function Open-SafeUrl([string]$Url) {
+    $parsed = $null
+    if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$parsed) -or $parsed.Scheme -notin @('http','https') -or $Url -match '[\x00-\x20"]') {
+        $script:exitCode = 1
+        'FAIL:只允许有效的 http/https 链接'
+        return
+    }
+    if ($env:CLAUDE_SWITCHER_SKIP_NET_CHECK -ne '1' -and -not (Test-TunUp) -and -not (Test-ProxyAlive)) {
+        $script:exitCode = 1
+        'FAIL:代理未就绪(TUN 未接管且客户端未运行),拒绝打开以免直连'
+        return
+    }
+    $browser = [string]$env:CLAUDE_SWITCHER_CHROME
+    $candidates = @(
+        "$env:PROGRAMFILES\Google\Chrome\Application\chrome.exe",
+        "${env:PROGRAMFILES(X86)}\Google\Chrome\Application\chrome.exe",
+        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe",
+        "$env:PROGRAMFILES\Microsoft\Edge\Application\msedge.exe",
+        "${env:PROGRAMFILES(X86)}\Microsoft\Edge\Application\msedge.exe",
+        "$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe",
+        "$env:PROGRAMFILES\BraveSoftware\Brave-Browser\Application\brave.exe",
+        "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe",
+        "$env:LOCALAPPDATA\Chromium\Application\chrome.exe"
+    )
+    if (-not $browser) { $browser = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1 }
+    if (-not $browser -or -not (Test-Path -LiteralPath $browser -PathType Leaf)) {
+        $script:exitCode = 1
+        'FAIL:未找到 Chrome/Chromium/Edge/Brave'
+        return
+    }
+    $profile = Join-Path $env:TEMP ('claude-switcher-safe-' + [guid]::NewGuid().ToString('N'))
+    $watcher = Join-Path $env:TEMP ('claude-switcher-watch-' + [guid]::NewGuid().ToString('N') + '.ps1')
+    try {
+        New-Item -ItemType Directory -Path $profile -ErrorAction Stop | Out-Null
+        $browserArgs = @(
+            "--user-data-dir=$profile", '--no-first-run', '--no-default-browser-check',
+            '--disable-sync', '--disable-extensions',
+            '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+            "--lang=$($LOCALE_TARGET.Replace('_','-'))", $Url
+        )
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $browser
+        $psi.Arguments = ConvertTo-WindowsCommandLine $browserArgs
+        $psi.UseShellExecute = $false
+        $browserProcess = [System.Diagnostics.Process]::Start($psi)
+        $profileEsc = $profile.Replace("'", "''")
+        $watcherEsc = $watcher.Replace("'", "''")
+        $watchScript = "`$ErrorActionPreference = 'SilentlyContinue'`nWait-Process -Id $($browserProcess.Id)`nRemove-Item -LiteralPath '$profileEsc' -Recurse -Force`nRemove-Item -LiteralPath '$watcherEsc' -Force`n"
+        [System.IO.File]::WriteAllText($watcher, $watchScript, (New-Object System.Text.UTF8Encoding($true)))
+        Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $watcher + '"') -ErrorAction Stop
+        'OK:已在一次性隔离浏览器打开(profile 将在窗口关闭后销毁)'
+        'INFO:该窗口不继承日常浏览器的 cookies/插件；其中产生的会话会随窗口关闭丢弃'
+    } catch {
+        Remove-Item -LiteralPath $profile -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $watcher -Force -ErrorAction SilentlyContinue
+        $script:exitCode = 1
+        "FAIL:无法启动隔离浏览器:$($_.Exception.Message)"
+    }
+}
+
+function Invoke-ProxyDiagnostics([string[]]$DiagnosticArgs) {
+    $report = [ordered]@{
+        schema_version = 1; mode = 'proxy_diagnostics'; scope = 'unauthenticated_transport_only'
+        account_status = 'not_evaluated'; leak_protection = 'not_evaluated'; launch_allowed = $null
+        application_started = $false; system_modified = $false
+    }
+    $proxy = ''; $public = $null
+    try {
+        if ($DiagnosticArgs.Count -eq 2 -and $DiagnosticArgs[0] -eq '--proxy') {
+            $proxy = [string]$DiagnosticArgs[1]; $source = 'argument'
+        } elseif ($DiagnosticArgs.Count -eq 2 -and $DiagnosticArgs[0] -eq '--config') {
+            $raw = [System.IO.File]::ReadAllText([string]$DiagnosticArgs[1], [System.Text.Encoding]::UTF8)
+            if ($raw.Length -gt 16384) { throw 'invalid config' }
+            $config = $raw | ConvertFrom-Json -ErrorAction Stop
+            $proxy = [string]$config.proxy_url; $source = 'config'
+        } elseif ($DiagnosticArgs.Count -eq 0 -and $env:CLAUDE_SWITCHER_PROXY_URL) {
+            $proxy = [string]$env:CLAUDE_SWITCHER_PROXY_URL; $source = 'environment'
+        } else { throw 'invalid arguments' }
+        if (-not $proxy -or $proxy -match '[\s\x00-\x1f\x7f]') { throw 'invalid proxy' }
+        $uri = [Uri]$proxy
+        if ($uri.Scheme -notin @('http','https','socks5','socks5h') -or -not $uri.Host -or
+            $uri.Port -lt 1 -or $uri.Port -gt 65535 -or $proxy -notmatch ':\d+/?$' -or
+            $uri.AbsolutePath -notin @('','/') -or $uri.Query -or $uri.Fragment) { throw 'invalid proxy' }
+        $address = $null
+        $loopback = ([System.Net.IPAddress]::TryParse($uri.Host, [ref]$address) -and [System.Net.IPAddress]::IsLoopback($address)) -or $uri.Host -eq 'localhost'
+        $public = [ordered]@{
+            scheme = $uri.Scheme; port = $uri.Port; host_scope = $(if ($loopback) { 'loopback' } else { 'remote' })
+            authentication_configured = [bool]$uri.UserInfo; source = $source
+        }
+    } catch {
+        $report.state = 'configuration_error'; $report.error = 'invalid_or_missing_proxy'
+        $report.hint = 'Use --proxy, --config, or CLAUDE_SWITCHER_PROXY_URL; an explicit port is required.'
+        [pscustomobject]$report | ConvertTo-Json -Depth 8 -Compress
+        $script:exitCode = 2
+        return
+    }
+
+    $targets = @(
+        [pscustomobject]@{ name = 'anthropic_api'; url = 'https://api.anthropic.com/v1/models' },
+        [pscustomobject]@{ name = 'claude_web'; url = 'https://claude.ai/' }
+    )
+    $checks = @()
+    foreach ($target in $targets) {
+        $check = [ordered]@{ name = $target.name; url = $target.url; transport_reached = $false; access = 'unknown' }
+        try {
+            $curl = Get-Command curl.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $curl) { $check.error = 'curl_unavailable'; $checks += [pscustomobject]$check; continue }
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $curl.Source
+            $curlArgs = @(
+                '-q', '--config', '-', '-sS', '-o', 'NUL', '--proto', '=https', '--noproxy', '',
+                '--connect-timeout', '6', '--max-time', '12', '-w',
+                '%{http_code}\t%{http_connect}\t%{ssl_verify_result}\t%{time_appconnect}\t%{time_total}', $target.url
+            )
+            $psi.Arguments = ConvertTo-WindowsCommandLine $curlArgs
+            $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+            $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+            $psi.EnvironmentVariables.Clear()
+            foreach ($name in @('PATH','SYSTEMROOT','WINDIR','TEMP','TMP','USERPROFILE','LANG','LC_ALL','SSL_CERT_FILE','SSL_CERT_DIR','CURL_CA_BUNDLE')) {
+                $value = [Environment]::GetEnvironmentVariable($name)
+                if ($null -ne $value) { $psi.EnvironmentVariables[$name] = $value }
+            }
+            $process = [System.Diagnostics.Process]::Start($psi)
+            $escapedProxy = $proxy.Replace('\', '\\').Replace('"', '\"')
+            $process.StandardInput.WriteLine('proxy = "' + $escapedProxy + '"')
+            $process.StandardInput.Close()
+            $timedOut = -not $process.WaitForExit(15000)
+            if ($timedOut) {
+                try { $process.Kill() } catch {}
+                $check.error = 'probe_timeout'
+                $checks += [pscustomobject]$check
+                continue
+            }
+            $stdout = $process.StandardOutput.ReadToEnd().Trim()
+            $null = $process.StandardError.ReadToEnd()
+            $fields = $stdout -split '\s+'
+            if ($fields.Count -lt 5) { throw 'invalid probe output' }
+            $status = [int]$fields[0]; $connect = [int]$fields[1]; $verify = [int]$fields[2]
+            $tls = [double]::Parse($fields[3], [Globalization.CultureInfo]::InvariantCulture)
+            $elapsed = [double]::Parse($fields[4], [Globalization.CultureInfo]::InvariantCulture)
+            if ($status -lt 0 -or $status -gt 599 -or $connect -lt 0 -or $connect -gt 599 -or $verify -lt 0 -or
+                [double]::IsNaN($tls) -or [double]::IsInfinity($tls) -or $tls -lt 0 -or
+                [double]::IsNaN($elapsed) -or [double]::IsInfinity($elapsed) -or $elapsed -lt 0) { throw 'invalid probe metrics' }
+            $reached = $process.ExitCode -eq 0 -and $status -gt 0 -and $verify -eq 0 -and $tls -gt 0
+            $check.curl_exit = $process.ExitCode; $check.http_status = $status; $check.proxy_connect_status = $connect
+            $check.tls_verified = $reached; $check.elapsed_seconds = $elapsed; $check.transport_reached = $reached
+            if ($reached) {
+                $check.access = if ($status -eq 401) { 'unauthenticated' } elseif ($status -in @(403,407)) { 'access_restricted' } elseif ($status -ge 500) { 'server_error' } else { 'http_response' }
+            }
+        } catch {
+            if (-not $check.Contains('error')) { $check.error = 'invalid_probe_output' }
+        }
+        $checks += [pscustomobject]$check
+    }
+    $reachedAll = @($checks | Where-Object { -not $_.transport_reached }).Count -eq 0
+    $report.proxy = $public; $report.checks = $checks
+    $report.state = if ($reachedAll) { 'transport_reached' } else { 'transport_failed' }
+    [pscustomobject]$report | ConvertTo-Json -Depth 8 -Compress
+    $script:exitCode = if ($reachedAll) { 0 } else { 1 }
+}
+
 function Get-ReleaseInfo {
     $current = Get-AppVersion
     try {
@@ -1789,6 +2059,8 @@ function Invoke-RulesStatus {
     Get-RulesStatus
 }
 
+if ($MyInvocation.InvocationName -eq '.') { return }
+
 $command = if ($args.Count -gt 0) { [string]$args[0] } else { '' }
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $exitCode = 0
@@ -1814,6 +2086,13 @@ try {
         'set-region'   { Invoke-SetRegion }
         'set-client'   { Set-ClientMode $args[1] }
         'get-client'   { Get-Client }
+        'fingerprint'  { Get-Fingerprint }
+        'cli-info'     { Get-CliInfo }
+        'open-safe'    { Open-SafeUrl $args[1] }
+        'diagnose-proxy' {
+            $diagnosticArgs = if ($args.Count -gt 1) { @($args[1..($args.Count - 1)]) } else { @() }
+            Invoke-ProxyDiagnostics $diagnosticArgs
+        }
         'check-update' { Invoke-CheckUpdate }
         'update-now'   { Invoke-UpdateNow }
         'rules-status' { Invoke-RulesStatus }
@@ -1828,7 +2107,7 @@ try {
         'export-diagnostics' { Export-Diagnostics $args[1] }
         default        {
             $exitCode = 1
-            "用法: claude-switch.ps1 checkdetail|status|fix|switch A|B|set-region|check-update|update-now|rules-status|get-check-config|set-check-config|export-diagnostics"
+            "用法: claude-switch.ps1 checkdetail|status|fix|switch A|B|set-region|check-update|update-now|rules-status|get-check-config|set-check-config|export-diagnostics|fingerprint|cli-info|open-safe|diagnose-proxy"
         }
     }
 } catch {
@@ -1836,6 +2115,8 @@ try {
     Write-Error $_
 } finally {
     $stopwatch.Stop()
-    Write-ClientLog $command $exitCode $stopwatch.ElapsedMilliseconds $summary
+    if ($command -ne 'diagnose-proxy') {
+        Write-ClientLog $command $exitCode $stopwatch.ElapsedMilliseconds $summary
+    }
 }
 exit $exitCode
