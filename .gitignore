@@ -7,5 +7,6 @@ last-check.txt
 
 build/
 _trash/
+.worktrees/
 
 .superpowers/
