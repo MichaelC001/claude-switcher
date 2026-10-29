@@ -315,12 +315,14 @@ final class VM: ObservableObject {
         guard Self.clientChoices.contains(where: { $0.key == key }) else { return }
         guard key != currentClient else { return }
         guard coreAvailable() else { markCoreMissing(); return }
+        isBusy = true
         isSwitchingClient = true
         banner = "正在切换代理客户端…"
         run(["set-client", key], timeout: operationTimeout) { result in
             self.isSwitchingClient = false
             guard result.succeeded else {
                 self.banner = result.output
+                self.isBusy = false
                 return
             }
             // 切换后重新完成环境审计,刷新「代理内核」等检查项
