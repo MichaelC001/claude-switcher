@@ -1022,9 +1022,10 @@ function Invoke-CheckDetail {
         $lastip = if (Test-Path $lastipFile) { (Get-Content $lastipFile -Raw).Trim() } else { '' }
         $ipCount = Add-IpHistory $e.ip
         $historyWarn = if ($ipCount -ge 3) { "；48h内出口IP变化$ipCount 次，建议固定节点" } else { '' }
+        $ipState = if ($ipCount -ge 3) { 'warn' } else { 'ok' }
         if (-not $e.ip) { Format-OptionalResult 'IP一致' 'fail' '未获取到出口IP' }
-        elseif (-not $lastip) { Format-OptionalResult 'IP一致' 'ok' "首次记录$historyWarn" }
-        elseif ($e.ip -eq $lastip) { Format-OptionalResult 'IP一致' 'ok' $historyWarn.TrimStart('；') }
+        elseif (-not $lastip) { Format-OptionalResult 'IP一致' $ipState "首次记录$historyWarn" }
+        elseif ($e.ip -eq $lastip) { Format-OptionalResult 'IP一致' $ipState $historyWarn.TrimStart('；') }
         else { Format-OptionalResult 'IP一致' 'warn' "$lastip → $($e.ip)$historyWarn" }
         if ($e.ip) { $e.ip | Out-File -Encoding ascii -NoNewline $lastipFile }
     }
@@ -1775,7 +1776,7 @@ function Invoke-ProxyDiagnostics([string[]]$DiagnosticArgs) {
             $uri.Port -lt 1 -or $uri.Port -gt 65535 -or $proxy -notmatch ':\d+/?$' -or
             $uri.AbsolutePath -notin @('','/') -or $uri.Query -or $uri.Fragment) { throw 'invalid proxy' }
         $address = $null
-        $loopback = ([System.Net.IPAddress]::TryParse($uri.Host, [ref]$address) -and [System.Net.IPAddress]::IsLoopback($address)) -or $uri.Host -eq 'localhost'
+        $loopback = ([System.Net.IPAddress]::TryParse($uri.Host.Trim('[',']'), [ref]$address) -and [System.Net.IPAddress]::IsLoopback($address)) -or $uri.Host -eq 'localhost'
         $public = [ordered]@{
             scheme = $uri.Scheme; port = $uri.Port; host_scope = $(if ($loopback) { 'loopback' } else { 'remote' })
             authentication_configured = [bool]$uri.UserInfo; source = $source
@@ -1983,7 +1984,7 @@ function Test-SnapshotArchive([string]$ZipPath, [string]$Target) {
         $marker = $null
         foreach ($entry in $zip.Entries) {
             $name = [string]$entry.FullName
-            if (-not $name -or $name.Contains('\') -or [System.IO.Path]::IsPathRooted($name) -or $name.StartsWith('/') -or $name -match '^[A-Za-z]:') { throw '快照包含非法路径' }
+            if (-not $name -or $name.Contains('\') -or $name.Contains(':') -or [System.IO.Path]::IsPathRooted($name) -or $name.StartsWith('/') -or $name -match '^[A-Za-z]:') { throw '快照包含非法路径' }
             $parts = $name.Split('/')
             if ($parts -contains '..') { throw '快照包含越界路径' }
             $fileType = ([uint32]$entry.ExternalAttributes -shr 16) -band 0xF000

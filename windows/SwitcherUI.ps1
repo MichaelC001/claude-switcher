@@ -347,19 +347,28 @@ function Refresh-Checks {
 }
 function Switch-To($target) {
     if ($script:isBusy -or $target -notin @('A','B','C','D')) { return }
-    if (-not $script:environmentReady) { Set-Banner '必须先完成并通过环境检查，正在重新检查' 'error'; Refresh-Checks; return }
-    Set-Status '切换中' ([System.Windows.Media.Color]::FromRgb(0x60,0xA5,0xFA)); Set-Banner "正在切换到账号 $target…" 'info'
-    Start-CommandOperation 'switch' @('switch',$target)
+    if (-not $script:environmentReady) { Set-Banner '上次检查未通过，切换前必须重新完成审计' 'warn' } else { Set-Banner "正在执行账号 $target 的切换前审计…" 'info' }
+    $script:pendingSwitch = $target
+    Refresh-Checks
 }
 function Complete-UiOperation([string]$Operation, $Result) {
     if ($Operation -eq 'refresh') {
-        if (-not $Result) { $script:environmentReady = $false; Set-Status '检查失败' ([System.Windows.Media.Color]::FromRgb(0xF8,0x71,0x71)); Set-Banner '核心脚本没有返回检查结果' 'error'; Set-Busy $false; return }
+        if (-not $Result) { $script:pendingSwitch = ''; $script:environmentReady = $false; Set-Status '检查失败' ([System.Windows.Media.Color]::FromRgb(0xF8,0x71,0x71)); Set-Banner '核心脚本没有返回检查结果' 'error'; Set-Busy $false; return }
         $statusOk = $Result.StatusExit -eq 0 -and (Apply-StatusOutput $Result.Status)
         $clientOk = $Result.ClientExit -eq 0 -and (Apply-ClientOutput $Result.Client)
         $checksOk = Apply-CheckOutput $Result.Checks $Result.CheckExit
         $script:environmentReady = $checksOk -and $statusOk -and $clientOk
         if (-not $statusOk -or -not $clientOk) { $script:environmentReady = $false; Set-Status '状态异常' ([System.Windows.Media.Color]::FromRgb(0xF8,0x71,0x71)); Set-Banner '无法读取账号或代理客户端状态，请更新核心脚本后重试' 'error' }
-        Set-Busy $false; return
+        Set-Busy $false
+        if ($script:environmentReady -and $script:pendingSwitch) {
+            $next = [string]$script:pendingSwitch
+            $script:pendingSwitch = ''
+            Set-Status '切换中' ([System.Windows.Media.Color]::FromRgb(0x60,0xA5,0xFA)); Set-Banner "正在切换到账号 $next…" 'info'
+            Start-CommandOperation 'switch' @('switch',$next)
+        } else {
+            $script:pendingSwitch = ''
+        }
+        return
     }
     $text = if ($Result -and $Result.Text) { [string]$Result.Text } else { '' }
     $exit = if ($Result -and $null -ne $Result.Exit) { [int]$Result.Exit } else { 1 }

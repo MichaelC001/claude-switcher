@@ -57,7 +57,10 @@ class WindowsUiParityStaticTests(unittest.TestCase):
         switch = self.ui[self.ui.index("function Switch-To"):]
         switch = switch[:switch.index("\nfunction ")]
         self.assertIn("environmentReady", switch)
-        self.assertIn("Refresh-Checks", switch)
+        self.assertIn("$script:pendingSwitch = $target", switch)
+        self.assertLess(switch.index("$script:pendingSwitch = $target"), switch.index("Refresh-Checks"))
+        complete = self.ui[self.ui.index("function Complete-UiOperation"):]
+        self.assertIn("$script:pendingSwitch", complete)
 
     def test_snapshot_passwords_use_stdin_not_arguments(self):
         self.assertIn("PasswordBox", self.ui)

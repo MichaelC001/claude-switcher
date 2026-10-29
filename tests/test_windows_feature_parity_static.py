@@ -42,6 +42,12 @@ class WindowsFeatureParityStaticTests(unittest.TestCase):
         self.assertLess(disabled, history)
         self.assertLess(history, timezone)
 
+    def test_ip_history_threshold_is_a_visible_warning_not_a_green_pass(self):
+        start = self.core.index("$ipCount = Add-IpHistory")
+        body = self.core[start:self.core.index("$tz = (Get-TimeZone).Id", start)]
+        self.assertIn("$ipState = if ($ipCount -ge 3) { 'warn' } else { 'ok' }", body)
+        self.assertIn("Format-OptionalResult 'IP一致' $ipState", body)
+
     def test_keep_paths_preserve_recovery_copies_and_block_reparse_points(self):
         for name in ("Test-KeepPathSafe", "Stage-KeepPaths", "Restore-KeepPaths"):
             self.assertIn(f"function {name}", self.core)

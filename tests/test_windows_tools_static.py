@@ -54,6 +54,7 @@ class WindowsToolsStaticTests(unittest.TestCase):
         self.assertIn("EnvironmentVariables.Clear", body)
         self.assertIn("WaitForExit(15000)", body)
         self.assertIn("ssl_verify_result", body)
+        self.assertIn("$uri.Host.Trim('[',']')", body)
         self.assertIn("configuration_error", body)
         self.assertIn("transport_reached", body)
         self.assertIn("launch_allowed", body)

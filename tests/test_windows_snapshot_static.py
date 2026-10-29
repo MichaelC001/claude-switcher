@@ -38,6 +38,7 @@ class WindowsSnapshotStaticTests(unittest.TestCase):
         self.assertIn("function Test-SnapshotArchive", self.core)
         self.assertIn("IsPathRooted", self.core)
         self.assertIn("'..'", self.core)
+        self.assertIn("$name.Contains(':')", self.core)
         self.assertIn("ExternalAttributes", self.core)
         self.assertIn("0xA000", self.core)
 
