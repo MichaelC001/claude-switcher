@@ -93,7 +93,7 @@ class WindowsRulesStaticTests(unittest.TestCase):
             "/configs",
             "Authorization",
             "Bearer ",
-            "TimeoutSec = 3",
+            "Invoke-ClashApi '/configs' 3",
             "clash-verge.yaml",
             "verge.yaml",
             "(?m)^mode:",
@@ -200,7 +200,7 @@ class WindowsRulesStaticTests(unittest.TestCase):
             "Wait-ClashRules",
             "Test-PinnedRules",
             "Restore-ClashScriptChange",
-            "FIX:规则已写入但无法验证内核加载(控制接口不可用)",
+            "FIX:规则已写入但无法验证内核加载($(Get-ClashApiHint $rulesInfo.reason))",
             "FIX:置顶规则验证失败,正在回滚 Script.js",
         ):
             with self.subTest(needle=needle):
@@ -208,7 +208,7 @@ class WindowsRulesStaticTests(unittest.TestCase):
 
         rules_body = between(text, "function Get-ClashRules", "function Test-PinnedRules")
         self.assertIn("/rules", rules_body)
-        self.assertIn("TimeoutSec = 3", rules_body)
+        self.assertIn("Invoke-ClashApi '/rules' 8", rules_body)
         pinned_body = between(text, "function Test-PinnedRules", "function Write-ClashScriptRules")
         self.assertIn("Select-Object -First 16", pinned_body)
         self.assertIn("DST-PORT", pinned_body)

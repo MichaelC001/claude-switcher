@@ -66,6 +66,29 @@ TUN 判定顺序：先看是否存在 `198.18.x.x` 假 IP（Clash 系 fake-ip）
 
 「一键修复」的规则模式/清理结果会显示在界面 Banner；检查列表的「规则置顶」也会同步显示 `ok` / `warn` / `fail`。
 
+### 规则置顶告警怎么读
+
+`规则置顶=warn:规则已写入但无法验证内核加载(...)` 表示 `Script.js` 里的托管块确实存在，但读不到 Mihomo 控制接口，**无法确认内核是否真的加载了这些规则**。括号里是原因：控制接口未配置 / 拒绝连接 / 鉴权失败 / 超时。这是「验证不了」，不等于「规则没生效」，也不等于「已经生效」。
+
+只读排查命令（不修改任何配置、不需要管理员）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.claude-switcher\claude-switch.ps1" rules-status
+```
+
+它会打印当前模式、控制接口的来源文件与端点、`/configs` 与 `/rules` 是否可达、`Script.js` 状态，以及内核前 18 条规则（`pinned=yes` 说明 16 条置顶规则都在）。
+
+常见原因与处理：
+
+| 括号里的原因 | 含义 | 处理 |
+| --- | --- | --- |
+| `控制接口未配置` | `clash-verge.yaml` / `config.yaml` / `verge.yaml` 里都没有 `external-controller` | 在 Clash Verge 设置里打开「外部控制」并设置端口 |
+| `控制接口拒绝连接` | 端口没监听：Verge 没开外部控制、端口不对，或刚重启还没起来 | 确认端口后重启 Verge，等 TUN 就绪再检查 |
+| `控制接口鉴权失败` | `secret` 与运行实例不一致 | 用 `rules-status` 里的 `auth=` 与配置核对 |
+| `控制接口超时` | `/rules` 响应过大或内核无响应 | 稍后重试；`rules-status` 已把超时放宽到 8 秒 |
+
+控制接口地址可以写在三个文件中的任意一个，Windows 版会依次读 `clash-verge.yaml` → `config.yaml` → `verge.yaml`（不支持 unix socket）。若你的 Verge 只用 unix socket，请改用全局模式，或直接在 Verge 的「规则」页面确认前 16 条是否为 Claude 域名。
+
 ## 地区自适应与 set-region
 
 - **安装时自动识别**：安装器按出口国家写入 `$COUNTRY_TARGET`、`$TZ_TARGET` 和 `$LOCALE_TARGET`，并尝试设置系统时区与地区格式；出口为 `CN` 时拒绝安装。国家→时区/地区格式映射覆盖 US / JP / TW / HK / SG / GB / DE / FR / KR / AU / CA / MY，其他回退 `America/New_York` / `en-US`。
