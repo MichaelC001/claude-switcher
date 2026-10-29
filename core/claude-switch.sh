@@ -4,6 +4,207 @@
 set -u
 export LC_ALL=en_US.UTF-8
 
+if [ "${1:-}" = "_support" ]; then
+    shift
+    exec "${CLAUDE_SWITCHER_PYTHON:-python3}" - "$@" <<'PY_SUPPORT'
+import datetime
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import sys
+import tempfile
+import zipfile
+
+
+OPTIONAL = ("IP一致", "DNS", "WebRTC", "客户端语言", "ASN属性", "生态可达性")
+ALL_CHECKS = ("代理内核", "TUN网卡", "出口IP", "IP一致", "时区", "地区", "IPv6", "DNS",
+              "WebRTC", "保镖", "规则置顶", "客户端语言", "ASN属性", "生态可达性")
+DEFAULTS = {"disabled": [], "allowOptionalFailures": False, "logging": True}
+LOG_LIMIT = 512 * 1024
+
+
+def fail():
+    print("配置或诊断参数无效", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def paths():
+    home = Path.home()
+    return home / ".claude-switcher", home / "Library/Logs/claude-switcher/client.log"
+
+
+def validate(value):
+    if not isinstance(value, dict) or set(value) - set(DEFAULTS):
+        fail()
+    result = dict(DEFAULTS)
+    disabled = value.get("disabled", [])
+    if (not isinstance(disabled, list)
+            or any(not isinstance(item, str) or item not in OPTIONAL for item in disabled)
+            or len(disabled) != len(set(disabled))):
+        fail()
+    result["disabled"] = [name for name in OPTIONAL if name in disabled]
+    for key in ("allowOptionalFailures", "logging"):
+        if key in value:
+            if type(value[key]) is not bool:
+                fail()
+            result[key] = value[key]
+    return result
+
+
+def load_config():
+    base, _ = paths()
+    path = base / "checks.json"
+    if not path.exists():
+        return dict(DEFAULTS)
+    try:
+        with path.open(encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, ValueError):
+        fail()
+    return validate(value)
+
+
+def app_version():
+    value = os.environ.get("CLAUDE_SWITCHER_VERSION", "").strip()
+    if value and re.fullmatch(r"[A-Za-z0-9._-]{1,40}", value):
+        return value
+    base, _ = paths()
+    try:
+        value = (base / "version.txt").read_text(encoding="utf-8").strip()
+    except OSError:
+        value = ""
+    return value if re.fullmatch(r"[A-Za-z0-9._-]{1,40}", value) else "unknown"
+
+
+def write_log(args):
+    config = load_config()
+    if not config["logging"]:
+        return
+    if len(args) != 4 or not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", args[0]):
+        fail()
+    if not re.fullmatch(r"\d{1,3}", args[1]) or not 0 <= int(args[1]) <= 255:
+        fail()
+    if not re.fullmatch(r"\d{1,12}", args[2]):
+        fail()
+    tokens = args[3].split()
+    checks = {}
+    for token in tokens:
+        match = re.fullmatch(r"([A-Za-z0-9\u4e00-\u9fff]+)=(ok|warn|fail|skip)", token)
+        if not match or match.group(1) not in ALL_CHECKS or match.group(1) in checks:
+            fail()
+        checks[match.group(1)] = match.group(2)
+    summary = " ".join(name + "=" + checks[name] for name in ALL_CHECKS if name in checks)
+    line = (datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+            + " version=" + app_version() + " command=" + args[0]
+            + " exit=" + str(int(args[1])) + " duration_ms=" + str(int(args[2]))
+            + ((" " + summary) if summary else "") + "\n")
+    _, log_path = paths()
+    log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(log_path.parent, 0o700)
+        if log_path.exists() and log_path.stat().st_size + len(line.encode("utf-8")) > LOG_LIMIT:
+            os.replace(log_path, log_path.with_name("client.log.1"))
+        with log_path.open("a", encoding="utf-8") as handle:
+            os.chmod(log_path, 0o600)
+            handle.write(line)
+    except OSError:
+        fail()
+
+
+def recent_status():
+    base, _ = paths()
+    result = {}
+    try:
+        lines = (base / "last-check.txt").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        match = re.fullmatch(r"([^=]+)=(ok|warn|fail|skip)(?::.*)?", line)
+        if match and match.group(1) in ALL_CHECKS and match.group(1) not in result:
+            result[match.group(1)] = match.group(2)
+    return result
+
+
+def safe_log_lines():
+    _, log_path = paths()
+    try:
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    allowed = re.compile(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00 version=[A-Za-z0-9._-]+ "
+        r"command=[a-z][a-z0-9-]{0,31} exit=\d{1,3} duration_ms=\d{1,12}"
+        r"(?: (?:[A-Za-z0-9\u4e00-\u9fff]+=(?:ok|warn|fail|skip) ?)*)?")
+    return [line for line in lines[-2000:] if allowed.fullmatch(line)]
+
+
+def export_diagnostics(args):
+    if len(args) != 1 or not args[0] or "\x00" in args[0]:
+        fail()
+    destination = Path(args[0]).expanduser()
+    base, _ = paths()
+    environment = {"schema_version": 1, "platform": platform.system(),
+                   "app_version": app_version(),
+                   "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, value in (("environment.json", environment),
+                                ("recent-status.json", {"checks": recent_status()}),
+                                ("checks.json", load_config())):
+                archive.writestr(name, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+            archive.writestr("client.log", "\n".join(safe_log_lines()) + "\n")
+        os.chmod(destination, 0o600)
+    except OSError:
+        fail()
+    print("OK:诊断日志已导出（不含 IP、凭据、账号或代理配置）")
+
+
+def main(args):
+    if not args:
+        fail()
+    action = args[0]
+    if action == "config" and len(args) == 1:
+        config = load_config()
+        print("disabled=" + ",".join(config["disabled"]))
+        print("allowOptionalFailures=" + str(int(config["allowOptionalFailures"])))
+        print("logging=" + str(int(config["logging"])))
+    elif action == "config-get" and len(args) == 1:
+        print(json.dumps(load_config(), ensure_ascii=False))
+    elif action == "config-set" and len(args) == 2:
+        raw = args[1].encode("utf-8")
+        if len(raw) > 16384:
+            fail()
+        try:
+            config = validate(json.loads(raw.decode("utf-8")))
+        except (ValueError, UnicodeError):
+            fail()
+        base, _ = paths()
+        try:
+            base.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd, temporary = tempfile.mkstemp(prefix=".checks-", dir=base)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(config, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, base / "checks.json")
+        except OSError:
+            fail()
+    elif action == "log":
+        write_log(args[1:])
+    elif action == "export-diagnostics":
+        export_diagnostics(args[1:])
+    else:
+        fail()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+PY_SUPPORT
+fi
+
 # 随现有单脚本更新分发;在任何账号状态读写、审计/修复/启动之前分派。
 if [ "${1:-}" = "diagnose-proxy" ]; then
     shift
@@ -546,6 +747,37 @@ mkdir -p "$BASE/accounts"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >>"$LOG"; }
 
+CHECKS_DISABLED=""
+ALLOW_OPTIONAL_FAILURES=0
+load_check_config() {
+    local config key value
+    config=$("$0" _support config 2>/dev/null) || return 1
+    while IFS='=' read -r key value; do
+        case "$key" in
+            disabled) CHECKS_DISABLED="$value" ;;
+            allowOptionalFailures) ALLOW_OPTIONAL_FAILURES="$value" ;;
+        esac
+    done <<< "$config"
+}
+check_disabled() { case ",$CHECKS_DISABLED," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+optional_failure() {
+    [ "$ALLOW_OPTIONAL_FAILURES" = "1" ] || fails="$fails;$1"
+}
+optional_result() {
+    local name="$1" state="$2" detail="${3:-}"
+    if check_disabled "$name"; then
+        echo "$name=skip:用户已禁用"
+    elif [ "$state" = "fail" ] && [ "$ALLOW_OPTIONAL_FAILURES" = "1" ]; then
+        echo "$name=warn:非关键失败已忽略${detail:+($detail)}"
+    else
+        echo "$name=$state${detail:+:$detail}"
+    fi
+}
+log_result() {
+    local started="$1" command="$2" rc="$3" summary="${4:-}"
+    "$0" _support log "$command" "$rc" "$(( ($(date +%s) - started) * 1000 ))" "$summary" >/dev/null 2>&1 || true
+}
+
 # TUN 在线判定:存在 fake-ip 网段地址即视为 TUN 已接管(兼容各种 TUN 设备名)
 tun_up() { ifconfig 2>/dev/null | grep -q 'inet 198\.18\.'; }
 
@@ -774,6 +1006,7 @@ iphist_count() {
 
 # ---------- 安全检查 ----------
 check() {
+    load_check_config || { echo "FAIL:检查配置无效，请恢复默认设置"; return 1; }
     fails=""
 
     proxy_alive || fails="$fails;代理内核未运行"
@@ -784,16 +1017,18 @@ check() {
     loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
     [ "$loc" = "$COUNTRY_TARGET" ] || fails="$fails;出口IP异常(${ip:-无}/${loc:-未知},期望$COUNTRY_TARGET)"
     ipwarn=""
-    lastip=""; [ -f "$BASE/lastip" ] && lastip=$(cat "$BASE/lastip")
-    if [ -n "$ip" ] && [ -n "$lastip" ] && [ "$ip" != "$lastip" ]; then
-        ipwarn="注意:出口IP与上次不同($lastip -> $ip)"
-    fi
-    [ -n "$ip" ] && echo "$ip" > "$BASE/lastip"
+    if ! check_disabled "IP一致"; then
+        lastip=""; [ -f "$BASE/lastip" ] && lastip=$(cat "$BASE/lastip")
+        if [ -n "$ip" ] && [ -n "$lastip" ] && [ "$ip" != "$lastip" ]; then
+            ipwarn="注意:出口IP与上次不同($lastip -> $ip)"
+        fi
+        [ -n "$ip" ] && echo "$ip" > "$BASE/lastip"
 
-    # IP 审查:48h 内出口 IP 变化 ≥3 次追加警告(只 warn 不 fail)
-    ipn=$(iphist_count "$ip")
-    if [ "$ipn" -ge 3 ] 2>/dev/null; then
-        ipwarn="${ipwarn:+$ipwarn; }注意:48h内出口IP变化${ipn}次,账号画像有风险,建议固定节点"
+        # IP 审查:48h 内出口 IP 变化 ≥3 次追加警告(只 warn 不 fail)
+        ipn=$(iphist_count "$ip")
+        if [ "$ipn" -ge 3 ] 2>/dev/null; then
+            ipwarn="${ipwarn:+$ipwarn; }注意:48h内出口IP变化${ipn}次,账号画像有风险,建议固定节点"
+        fi
     fi
 
     tz=$(readlink /etc/localtime 2>/dev/null)
@@ -805,14 +1040,18 @@ check() {
     v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
     echo "$v6" | grep -qi 'off' || fails="$fails;IPv6未关闭"
 
-    dnsip=$(dig +short +time=3 +tries=1 claude.ai 2>/dev/null | head -1)
-    case "$dnsip" in
-        198.18.*) ;;
-        *) fails="$fails;DNS未走隧道(返回${dnsip:-空})" ;;
-    esac
+    if ! check_disabled "DNS"; then
+        dnsip=$(dig +short +time=3 +tries=1 claude.ai 2>/dev/null | head -1)
+        case "$dnsip" in
+            198.18.*) ;;
+            *) optional_failure "DNS未走隧道" ;;
+        esac
+    fi
 
-    wr=$(webrtc_status "$ip")
-    case "$wr" in fail:*) fails="$fails;WebRTC:${wr#fail:}" ;; esac
+    if ! check_disabled "WebRTC"; then
+        wr=$(webrtc_status "$ip")
+        case "$wr" in fail:*) optional_failure "WebRTC:${wr#fail:}" ;; esac
+    fi
 
     guard_state=$(bodyguard_status)
     case "$guard_state" in
@@ -828,14 +1067,18 @@ check() {
         route_ok || fails="$fails;置顶规则缺失(未命中:${ROUTE_MISSED# })"
     fi
 
-    defaults read com.anthropic.claudefordesktop AppleLanguages 2>/dev/null | grep -q 'en-US' || {
-        syslang=$(defaults read -g AppleLanguages 2>/dev/null | sed -n '2p' | tr -d ' ,"')
-        [[ "$syslang" == en* ]] || fails="$fails;客户端语言为中文"
-    }
+    if ! check_disabled "客户端语言"; then
+        defaults read com.anthropic.claudefordesktop AppleLanguages 2>/dev/null | grep -q 'en-US' || {
+            syslang=$(defaults read -g AppleLanguages 2>/dev/null | sed -n '2p' | tr -d ' ,"')
+            [[ "$syslang" == en* ]] || optional_failure "客户端语言为中文"
+        }
+    fi
 
-    r1=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' https://claude.ai/ 2>/dev/null)
-    r2=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' https://api.anthropic.com/v1/models 2>/dev/null)
-    { [ "$r1" = "000" ] || [ "$r2" = "000" ]; } && fails="$fails;Anthropic生态不可达($r1/$r2)"
+    if ! check_disabled "生态可达性"; then
+        r1=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' https://claude.ai/ 2>/dev/null)
+        r2=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' https://api.anthropic.com/v1/models 2>/dev/null)
+        { [ "$r1" = "000" ] || [ "$r2" = "000" ]; } && optional_failure "Anthropic生态不可达($r1/$r2)"
+    fi
 
     if [ -n "$fails" ]; then
         echo "FAIL:${fails#;}"
@@ -925,6 +1168,7 @@ bodyguard_status() {
 
 # 逐项输出检查结果(供UI使用): 名称=ok|fail:细节
 checkdetail() {
+    load_check_config || { echo "检查配置无效，请恢复默认设置"; return 1; }
     if proxy_alive; then
         case "$PROXY_MODE" in
             shadowrocket) echo '代理内核=ok:Shadowrocket 已连接' ;;
@@ -938,15 +1182,17 @@ checkdetail() {
     ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
     loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
     if [ "$loc" = "$COUNTRY_TARGET" ]; then echo "出口IP=ok:$ip/$loc"; else echo "出口IP=fail:${ip:-无}/${loc:-未知}(期望$COUNTRY_TARGET)"; fi
-    lastip=""; [ -f "$BASE/lastip" ] && lastip=$(cat "$BASE/lastip")
-    ipst=""; ipdt=""
-    if [ -z "$ip" ]; then echo 'IP一致=fail:未获取到出口IP'
-    elif [ -z "$lastip" ]; then ipst="ok"; ipdt="首次记录"
-    elif [ "$ip" = "$lastip" ]; then ipst="ok"
-    else ipst="warn"; ipdt="$lastip → $ip"; fi
-    [ -n "$ip" ] && echo "$ip" > "$BASE/lastip"
-    # IP 审查:48h 内出口 IP 变化 ≥3 次提示账号画像风险(只 warn 不 fail)
-    if [ -n "$ipst" ]; then
+    if check_disabled "IP一致"; then
+        optional_result "IP一致" ok
+    else
+        lastip=""; [ -f "$BASE/lastip" ] && lastip=$(cat "$BASE/lastip")
+        ipst=""; ipdt=""
+        if [ -z "$ip" ]; then ipst="fail"; ipdt="未获取到出口IP"
+        elif [ -z "$lastip" ]; then ipst="ok"; ipdt="首次记录"
+        elif [ "$ip" = "$lastip" ]; then ipst="ok"
+        else ipst="warn"; ipdt="$lastip → $ip"; fi
+        [ -n "$ip" ] && echo "$ip" > "$BASE/lastip"
+        # IP 审查:48h 内出口 IP 变化 ≥3 次提示账号画像风险(只 warn 不 fail)
         ipn=$(iphist_count "$ip")
         if [ "$ipn" -ge 3 ] 2>/dev/null; then
             if [ "$ipst" = "ok" ]; then
@@ -955,7 +1201,7 @@ checkdetail() {
                 ipdt="$ipdt;48h内出口IP变化${ipn}次,账号画像有风险,建议固定节点"
             fi
         fi
-        if [ -z "$ipdt" ]; then echo "IP一致=$ipst"; else echo "IP一致=$ipst:$ipdt"; fi
+        optional_result "IP一致" "$ipst" "$ipdt"
     fi
     tz=$(readlink /etc/localtime 2>/dev/null)
     if [ "$tz" = "/var/db/timezone/zoneinfo/$TZ_TARGET" ]; then echo '时区=ok'; else echo "时区=fail:$tz"; fi
@@ -963,12 +1209,23 @@ checkdetail() {
     if [ "$locale" = "$LOCALE_TARGET" ]; then echo '地区=ok'; else echo "地区=fail:$locale"; fi
     v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
     if echo "$v6" | grep -qi 'off'; then echo 'IPv6=ok:已关闭'; else echo 'IPv6=fail:未关闭'; fi
-    dnsip=$(dig +short +time=3 +tries=1 claude.ai 2>/dev/null | head -1)
-    case "$dnsip" in
-        198.18.*) echo 'DNS=ok:走隧道' ;;
-        *) echo "DNS=fail:未走隧道(${dnsip:-空})" ;;
-    esac
-    echo "WebRTC=$(webrtc_status "$ip")"
+    if check_disabled "DNS"; then
+        optional_result "DNS" ok
+    else
+        dnsip=$(dig +short +time=3 +tries=1 claude.ai 2>/dev/null | head -1)
+        case "$dnsip" in
+            198.18.*) optional_result "DNS" ok "走隧道" ;;
+            *) optional_result "DNS" fail "未走隧道(${dnsip:-空})" ;;
+        esac
+    fi
+    if check_disabled "WebRTC"; then
+        optional_result "WebRTC" ok
+    else
+        wr=$(webrtc_status "$ip")
+        wrst=${wr%%:*}; wrdt=""
+        case "$wr" in *:*) wrdt=${wr#*:} ;; esac
+        optional_result "WebRTC" "$wrst" "$wrdt"
+    fi
     echo "保镖=$(bodyguard_status)"
     # 置顶规则:Clash Verge 验证运行内核;全局模式下规则不适用(全部流量已走代理)
     if [ "$PROXY_MODE" = "clash-verge" ]; then
@@ -987,35 +1244,47 @@ checkdetail() {
         fi
     fi
     # 12. Claude 客户端语言(单独设为英文,或系统首选语言为英文均可;防止 JS 层读出中文)
-    clang=$(defaults read com.anthropic.claudefordesktop AppleLanguages 2>/dev/null | head -2)
-    syslang=$(defaults read -g AppleLanguages 2>/dev/null | sed -n '2p' | tr -d ' ,"')
-    if echo "$clang" | grep -q 'en-US'; then
-        echo '客户端语言=ok:en-US'
-    elif [[ "$syslang" == en* ]]; then
-        echo '客户端语言=ok:跟随系统(英文)'
+    if check_disabled "客户端语言"; then
+        optional_result "客户端语言" ok
     else
-        echo '客户端语言=fail:跟随系统(中文)'
+        clang=$(defaults read com.anthropic.claudefordesktop AppleLanguages 2>/dev/null | head -2)
+        syslang=$(defaults read -g AppleLanguages 2>/dev/null | sed -n '2p' | tr -d ' ,"')
+        if echo "$clang" | grep -q 'en-US'; then
+            optional_result "客户端语言" ok "en-US"
+        elif [[ "$syslang" == en* ]]; then
+            optional_result "客户端语言" ok "跟随系统(英文)"
+        else
+            optional_result "客户端语言" fail "跟随系统(中文)"
+        fi
     fi
     # 13. ASN 网络属性(住宅宽带 vs 机房,按目标地区收录主流运营商)
-    org=$(curl -s --max-time 6 https://ipinfo.io/json 2>/dev/null | grep '"org"' | cut -d'"' -f4)
-    case "$org" in
-        '') echo 'ASN属性=warn:未获取' ;;
-        *Comcast*|*AT\&T*|*Verizon*|*Spectrum*|*Charter*|*Cox*|*T-Mobile*|*Cable*|*esidential*|\
-        *NTT*|*KDDI*|*SoftBank*|*IIJ*|*OCN*|*So-net*|\
-        *HiNet*|*Chunghwa*|*CHT*|*kbro*|*Taiwan*|*FarEasTone*|*Data\ Communication*|\
-        *Singtel*|*StarHub*|*M1*|\
-        *HKT*|*PCCW*|*HKBN*|*HGC*|\
-        *BT*|*Sky*|*Virgin*|*TalkTalk*|*Vodafone*|\
-        *Deutsche\ Telekom*|*1\&1*|*O2*) echo "ASN属性=ok:$org" ;;
-        *) echo "ASN属性=warn:疑似机房($org)" ;;
-    esac
-    # 14. Anthropic 生态可达性
-    r1=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' https://claude.ai/ 2>/dev/null)
-    r2=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' https://api.anthropic.com/v1/models 2>/dev/null)
-    if [ "$r1" != "000" ] && [ "$r2" != "000" ]; then
-        echo "生态可达性=ok:claude.ai:$r1 api:$r2"
+    if check_disabled "ASN属性"; then
+        optional_result "ASN属性" ok
     else
-        echo "生态可达性=fail:claude.ai:$r1 api:$r2"
+        org=$(curl -s --max-time 6 https://ipinfo.io/json 2>/dev/null | grep '"org"' | cut -d'"' -f4)
+        case "$org" in
+            '') optional_result "ASN属性" warn "未获取" ;;
+            *Comcast*|*AT\&T*|*Verizon*|*Spectrum*|*Charter*|*Cox*|*T-Mobile*|*Cable*|*esidential*|\
+            *NTT*|*KDDI*|*SoftBank*|*IIJ*|*OCN*|*So-net*|\
+            *HiNet*|*Chunghwa*|*CHT*|*kbro*|*Taiwan*|*FarEasTone*|*Data\ Communication*|\
+            *Singtel*|*StarHub*|*M1*|\
+            *HKT*|*PCCW*|*HKBN*|*HGC*|\
+            *BT*|*Sky*|*Virgin*|*TalkTalk*|*Vodafone*|\
+            *Deutsche\ Telekom*|*1\&1*|*O2*) optional_result "ASN属性" ok "$org" ;;
+            *) optional_result "ASN属性" warn "疑似机房($org)" ;;
+        esac
+    fi
+    # 14. Anthropic 生态可达性
+    if check_disabled "生态可达性"; then
+        optional_result "生态可达性" ok
+    else
+        r1=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' https://claude.ai/ 2>/dev/null)
+        r2=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' https://api.anthropic.com/v1/models 2>/dev/null)
+        if [ "$r1" != "000" ] && [ "$r2" != "000" ]; then
+            optional_result "生态可达性" ok "claude.ai:$r1 api:$r2"
+        else
+            optional_result "生态可达性" fail "claude.ai:$r1 api:$r2"
+        fi
     fi
 }
 
@@ -1877,16 +2146,21 @@ switch_to() {
     return 0
 }
 
-case "${1:-}" in
+operation="${1:-}"
+started_at=$(date +%s)
+summary=""
+case "$operation" in
     check)  check ;;
     checkdetail)
         OUT_FILE="$BASE/last-check.txt"
         {
             echo "# $(date '+%F %T') pid=$$ 开始"
             checkdetail
+            rc=$?
             echo "# 结束"
         } > "$OUT_FILE" 2>&1
         cat "$OUT_FILE"
+        summary=$(awk -F= '{ split($2, s, ":"); if ($1 != "" && s[1] ~ /^(ok|warn|fail|skip)$/) print $1 "=" s[1] }' "$OUT_FILE" | tr '\n' ' ')
         ;;
     fix) fix ;;
     status) status ;;
@@ -1900,7 +2174,16 @@ case "${1:-}" in
     cli-info) cli_info ;;
     snapshot-export) snapshot_export "${2:-}" "${3:-}" "${4:-}" ;;
     snapshot-import) snapshot_import "${2:-}" "${3:-}" "${4:-}" ;;
+    export-diagnostics) "$0" _support export-diagnostics "${2:-}" ;;
+    get-check-config) "$0" _support config-get ;;
+    set-check-config) "$0" _support config-set "${2:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac
+rc=$?
+case "$operation" in
+    get-check-config|set-check-config|export-diagnostics) ;;
+    *) log_result "$started_at" "$operation" "$rc" "$summary" ;;
+esac
+exit "$rc"

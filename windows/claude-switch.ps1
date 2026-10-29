@@ -14,6 +14,9 @@ $PROXY_GROUP = "GLOBAL"                # Clash 代理组名
 $BASE = Join-Path $env:USERPROFILE ".claude-switcher"
 $DATA = Join-Path $env:APPDATA "Claude"
 $LOG  = Join-Path $BASE "claude-switch.log"
+$CLIENT_LOG = Join-Path $BASE "logs\client.log"
+$CHECK_CONFIG = Join-Path $BASE "checks.json"
+$script:CheckConfig = $null
 $CLASH_DIR = @(
     (Join-Path $env:APPDATA "io.github.clash-verge-rev.clash-verge-rev"),
     (Join-Path $env:LOCALAPPDATA "io.github.clash-verge-rev.clash-verge-rev")
@@ -39,6 +42,134 @@ function Get-AppVersion {
         } catch {}
     }
     return 'unknown'
+}
+
+function ConvertTo-CheckConfig($Value) {
+    $optional = @('IP一致','DNS','WebRTC','客户端语言','ASN属性','生态可达性')
+    $keys = @('disabled','allowOptionalFailures','logging')
+    if ($null -eq $Value -or $Value -isnot [pscustomobject]) { throw '检查配置必须是 JSON 对象' }
+    foreach ($key in @($Value.PSObject.Properties.Name)) {
+        if ($keys -notcontains $key) { throw '检查配置包含未知字段' }
+    }
+    $disabled = @()
+    if ($Value.PSObject.Properties.Name -contains 'disabled') {
+        $raw = $Value.disabled
+        if ($null -eq $raw -or $raw -is [string] -or $raw -isnot [System.Collections.IEnumerable]) { throw 'disabled 必须是数组' }
+        $seen = @{}
+        foreach ($name in $raw) {
+            if ($name -isnot [string] -or $optional -notcontains $name -or $seen.ContainsKey($name)) { throw '只能关闭允许的非关键检查，且不能重复' }
+            $seen[$name] = $true
+            $disabled += $name
+        }
+    }
+    $allow = $false
+    $logging = $true
+    foreach ($key in @('allowOptionalFailures','logging')) {
+        if ($Value.PSObject.Properties.Name -contains $key) {
+            if ($Value.$key -isnot [bool]) { throw "$key 必须是布尔值" }
+        }
+    }
+    if ($Value.PSObject.Properties.Name -contains 'allowOptionalFailures') { $allow = [bool]$Value.allowOptionalFailures }
+    if ($Value.PSObject.Properties.Name -contains 'logging') { $logging = [bool]$Value.logging }
+    return @{ disabled = @($optional | Where-Object { $disabled -contains $_ }); allowOptionalFailures = $allow; logging = $logging }
+}
+
+function Get-CheckConfig {
+    if (-not (Test-Path -LiteralPath $CHECK_CONFIG)) {
+        return @{ disabled = @(); allowOptionalFailures = $false; logging = $true }
+    }
+    $raw = [System.IO.File]::ReadAllText($CHECK_CONFIG, [System.Text.Encoding]::UTF8)
+    if ($raw.Length -gt 16384) { throw '检查配置过大' }
+    return ConvertTo-CheckConfig ($raw | ConvertFrom-Json -ErrorAction Stop)
+}
+
+function Set-CheckConfigFromJson([string]$Json) {
+    if ([string]::IsNullOrWhiteSpace($Json) -or $Json.Length -gt 16384) { throw '检查配置为空或过大' }
+    $config = ConvertTo-CheckConfig ($Json | ConvertFrom-Json -ErrorAction Stop)
+    $jsonOut = [pscustomobject]@{ disabled = @($config.disabled); allowOptionalFailures = [bool]$config.allowOptionalFailures; logging = [bool]$config.logging } | ConvertTo-Json -Depth 3
+    $tmp = Join-Path $BASE ('.checks-' + [guid]::NewGuid().Guid + '.tmp')
+    try {
+        [System.IO.File]::WriteAllText($tmp, $jsonOut, (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $CHECK_CONFIG -Force -ErrorAction Stop
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-CheckDisabled([string]$Name) {
+    return ($null -ne $script:CheckConfig -and @($script:CheckConfig.disabled) -contains $Name)
+}
+
+function Format-OptionalResult([string]$Name, [string]$State, [string]$Detail = '') {
+    if (Test-CheckDisabled $Name) { return "$Name=skip:用户已禁用" }
+    if ($State -eq 'fail' -and $script:CheckConfig.allowOptionalFailures) {
+        return "$Name=warn:非关键失败已忽略$(if ($Detail) { "($Detail)" })"
+    }
+    return "$Name=$State$(if ($Detail) { ":$Detail" })"
+}
+
+function Write-ClientLog([string]$Command, [int]$ExitCode, [long]$DurationMs, [string]$Summary = '') {
+    try {
+        $config = Get-CheckConfig
+        if (-not $config.logging) { return }
+        if ($Command -notmatch '^[a-z][a-z0-9-]{0,31}$' -or $ExitCode -lt 0 -or $ExitCode -gt 255 -or $DurationMs -lt 0) { return }
+        $all = @('代理内核','TUN网卡','出口IP','IP一致','时区','地区','IPv6','DNS','WebRTC','保镖','规则置顶','客户端语言','ASN属性','生态可达性')
+        $states = @{}
+        foreach ($token in ($Summary -split '\s+')) {
+            if (-not $token) { continue }
+            $kv = $token -split '=', 2
+            if ($kv.Count -ne 2 -or $all -notcontains $kv[0] -or @('ok','warn','fail','skip') -notcontains $kv[1] -or $states.ContainsKey($kv[0])) { return }
+            $states[$kv[0]] = $kv[1]
+        }
+        $parts = @()
+        foreach ($name in $all) { if ($states.ContainsKey($name)) { $parts += "$name=$($states[$name])" } }
+        $version = Get-AppVersion
+        if ($version -notmatch '^[A-Za-z0-9._-]{1,40}$') { $version = 'unknown' }
+        $line = ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) + " version=$version command=$Command exit=$ExitCode duration_ms=$DurationMs"
+        if ($parts.Count) { $line += ' ' + ($parts -join ' ') }
+        $line += "`n"
+        $dir = Split-Path -Parent $CLIENT_LOG
+        New-Item -ItemType Directory -Force -Path $dir -ErrorAction Stop | Out-Null
+        if ((Test-Path -LiteralPath $CLIENT_LOG) -and ((Get-Item -LiteralPath $CLIENT_LOG).Length + [Text.Encoding]::UTF8.GetByteCount($line) -gt 524288)) {
+            Move-Item -LiteralPath $CLIENT_LOG -Destination "$CLIENT_LOG.1" -Force -ErrorAction Stop
+        }
+        [System.IO.File]::AppendAllText($CLIENT_LOG, $line, (New-Object System.Text.UTF8Encoding($false)))
+    } catch {}
+}
+
+function Export-Diagnostics([string]$Destination) {
+    if ([string]::IsNullOrWhiteSpace($Destination)) { throw '请选择诊断包保存位置' }
+    $stage = Join-Path $env:TEMP ('claude-diagnostics-' + [guid]::NewGuid().Guid)
+    New-Item -ItemType Directory -Force -Path $stage -ErrorAction Stop | Out-Null
+    try {
+        $version = Get-AppVersion
+        if ($version -notmatch '^[A-Za-z0-9._-]{1,40}$') { $version = 'unknown' }
+        $envInfo = [ordered]@{ schema_version = 1; platform = 'Windows'; app_version = $version; generated_at = ([DateTime]::UtcNow.ToString('o')) }
+        [System.IO.File]::WriteAllText((Join-Path $stage 'environment.json'), ($envInfo | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
+        $status = @{}
+        if (Test-Path -LiteralPath "$BASE\last-check.txt") {
+            $all = @('代理内核','TUN网卡','出口IP','IP一致','时区','地区','IPv6','DNS','WebRTC','保镖','规则置顶','客户端语言','ASN属性','生态可达性')
+            foreach ($line in [System.IO.File]::ReadAllLines("$BASE\last-check.txt")) {
+                if ($line -match '^([^=]+)=(ok|warn|fail|skip)(?::.*)?$' -and $all -contains $Matches[1] -and -not $status.ContainsKey($Matches[1])) {
+                    $status[$Matches[1]] = $Matches[2]
+                }
+            }
+        }
+        [System.IO.File]::WriteAllText((Join-Path $stage 'recent-status.json'), (@{ checks = $status } | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
+        $config = Get-CheckConfig
+        $configJson = [pscustomobject]@{ disabled = @($config.disabled); allowOptionalFailures = [bool]$config.allowOptionalFailures; logging = [bool]$config.logging } | ConvertTo-Json -Depth 3
+        [System.IO.File]::WriteAllText((Join-Path $stage 'checks.json'), $configJson, (New-Object System.Text.UTF8Encoding($false)))
+        $safe = @()
+        if (Test-Path -LiteralPath $CLIENT_LOG) {
+            $pattern = '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z version=[A-Za-z0-9._-]+ command=[a-z][a-z0-9-]{0,31} exit=\d{1,3} duration_ms=\d+(?: (?:[^=\s]+=(?:ok|warn|fail|skip) ?)*)?$'
+            $safe = @([System.IO.File]::ReadAllLines($CLIENT_LOG) | Where-Object { $_ -match $pattern } | Select-Object -Last 2000)
+        }
+        [System.IO.File]::WriteAllText((Join-Path $stage 'client.log'), (($safe -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+        Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $Destination -Force -ErrorAction Stop
+        'OK:诊断日志已导出（不含 IP、凭据、账号或代理配置）'
+    } finally {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # 版本号按 . 分段比较,每段只取前导数字(忽略 -beta 等后缀);unknown 视为最旧
@@ -803,6 +934,7 @@ function Get-RulesStatus {
 }
 
 function Invoke-CheckDetail {
+    try { $script:CheckConfig = Get-CheckConfig } catch { '检查配置无效，请恢复默认设置'; return }
     $pname = Get-ProxyName
     if (Test-ProxyAlive) {
         if ($PROXY_MODE -eq 'other') { "代理内核=ok:$pname(仅校验TUN)" }
@@ -818,13 +950,17 @@ function Invoke-CheckDetail {
     $e = Get-Egress
     if ($e.loc -eq $COUNTRY_TARGET) { "出口IP=ok:$($e.ip)" } else { "出口IP=fail:$($e.ip)/$($e.loc)(期望$COUNTRY_TARGET)" }
 
-    $lastipFile = "$BASE\lastip.txt"
-    $lastip = if (Test-Path $lastipFile) { (Get-Content $lastipFile -Raw).Trim() } else { '' }
-    if (-not $e.ip) { "IP一致=fail:未获取到出口IP" }
-    elseif (-not $lastip) { "IP一致=ok:首次记录" }
-    elseif ($e.ip -eq $lastip) { "IP一致=ok" }
-    else { "IP一致=warn:$lastip → $($e.ip)" }
-    if ($e.ip) { $e.ip | Out-File -Encoding ascii -NoNewline $lastipFile }
+    if (Test-CheckDisabled 'IP一致') {
+        Format-OptionalResult 'IP一致' 'ok'
+    } else {
+        $lastipFile = "$BASE\lastip.txt"
+        $lastip = if (Test-Path $lastipFile) { (Get-Content $lastipFile -Raw).Trim() } else { '' }
+        if (-not $e.ip) { Format-OptionalResult 'IP一致' 'fail' '未获取到出口IP' }
+        elseif (-not $lastip) { Format-OptionalResult 'IP一致' 'ok' '首次记录' }
+        elseif ($e.ip -eq $lastip) { Format-OptionalResult 'IP一致' 'ok' }
+        else { Format-OptionalResult 'IP一致' 'warn' "$lastip → $($e.ip)" }
+        if ($e.ip) { $e.ip | Out-File -Encoding ascii -NoNewline $lastipFile }
+    }
 
     $tz = (Get-TimeZone).Id
     if ($tz -eq $TZ_TARGET) { "时区=ok" } else { "时区=fail:$tz" }
@@ -835,11 +971,19 @@ function Invoke-CheckDetail {
     $v6off = [bool](Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq $true })
     if (-not $v6off) { "IPv6=ok:已关闭" } else { "IPv6=fail:未关闭" }
 
-    $dns = (Resolve-DnsName claude.ai -Type A -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress
-    if ($dns -like '198.18.*') { "DNS=ok:走隧道" } else { "DNS=fail:未走隧道($dns)" }
+    if (Test-CheckDisabled 'DNS') {
+        Format-OptionalResult 'DNS' 'ok'
+    } else {
+        $dns = (Resolve-DnsName claude.ai -Type A -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress
+        if ($dns -like '198.18.*') { Format-OptionalResult 'DNS' 'ok' '走隧道' } else { Format-OptionalResult 'DNS' 'fail' "未走隧道($dns)" }
+    }
 
-    $w = Test-WebRTC $e.ip
-    "WebRTC=$($w.code):$($w.detail)"
+    if (Test-CheckDisabled 'WebRTC') {
+        Format-OptionalResult 'WebRTC' 'ok'
+    } else {
+        $w = Test-WebRTC $e.ip
+        Format-OptionalResult 'WebRTC' ([string]$w.code) ([string]$w.detail)
+    }
 
     $bg = Get-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue
     if ($bg) { "保镖=ok" } else { "保镖=fail:未安装" }
@@ -847,23 +991,35 @@ function Invoke-CheckDetail {
     Get-RulesStatus
 
     # 客户端语言:Windows 版读不到 Claude 内部语言设置,只能比对系统 UI 语言;不一致时告警，不再无条件报 ok
-    $uiLang = [string]([System.Globalization.CultureInfo]::CurrentUICulture.Name)
-    $wantLang = ([string]$LOCALE_TARGET -split '-')[0].ToLowerInvariant()
-    if ($uiLang -and (($uiLang -split '-')[0].ToLowerInvariant()) -eq $wantLang) {
-        "客户端语言=ok:系统UI=$uiLang"
+    if (Test-CheckDisabled '客户端语言') {
+        Format-OptionalResult '客户端语言' 'ok'
     } else {
-        "客户端语言=warn:系统UI=$(if ($uiLang) { $uiLang } else { '未知' }),期望 $wantLang 前缀;Windows 版不读取客户端内部设置"
+        $uiLang = [string]([System.Globalization.CultureInfo]::CurrentUICulture.Name)
+        $wantLang = ([string]$LOCALE_TARGET -split '-')[0].ToLowerInvariant()
+        if ($uiLang -and (($uiLang -split '-')[0].ToLowerInvariant()) -eq $wantLang) {
+            Format-OptionalResult '客户端语言' 'ok' "系统UI=$uiLang"
+        } else {
+            Format-OptionalResult '客户端语言' 'warn' "系统UI=$(if ($uiLang) { $uiLang } else { '未知' }),期望 $wantLang 前缀;Windows 版不读取客户端内部设置"
+        }
     }
 
-    $org = ''
-    try { $org = ((& curl.exe -s --max-time 6 "https://ipinfo.io/json" 2>$null) | ConvertFrom-Json).org } catch {}
-    if (-not $org) { "ASN属性=warn:未获取" }
-    elseif ($org -match 'Comcast|AT&T|Verizon|Spectrum|Charter|Cox|T-Mobile|Cable|esidential') { "ASN属性=ok:$org" }
-    else { "ASN属性=warn:疑似机房($org)" }
+    if (Test-CheckDisabled 'ASN属性') {
+        Format-OptionalResult 'ASN属性' 'ok'
+    } else {
+        $org = ''
+        try { $org = ((& curl.exe -s --max-time 6 "https://ipinfo.io/json" 2>$null) | ConvertFrom-Json).org } catch {}
+        if (-not $org) { Format-OptionalResult 'ASN属性' 'warn' '未获取' }
+        elseif ($org -match 'Comcast|AT&T|Verizon|Spectrum|Charter|Cox|T-Mobile|Cable|esidential') { Format-OptionalResult 'ASN属性' 'ok' $org }
+        else { Format-OptionalResult 'ASN属性' 'warn' "疑似机房($org)" }
+    }
 
-    $r1 = & curl.exe -s --max-time 8 -o NUL -w '%{http_code}' "https://claude.ai/" 2>$null
-    $r2 = & curl.exe -s --max-time 8 -o NUL -w '%{http_code}' "https://api.anthropic.com/v1/models" 2>$null
-    if ($r1 -ne '000' -and $r2 -ne '000') { "生态可达性=ok:claude.ai:$r1 api:$r2" } else { "生态可达性=fail:claude.ai:$r1 api:$r2" }
+    if (Test-CheckDisabled '生态可达性') {
+        Format-OptionalResult '生态可达性' 'ok'
+    } else {
+        $r1 = & curl.exe -s --max-time 8 -o NUL -w '%{http_code}' "https://claude.ai/" 2>$null
+        $r2 = & curl.exe -s --max-time 8 -o NUL -w '%{http_code}' "https://api.anthropic.com/v1/models" 2>$null
+        if ($r1 -ne '000' -and $r2 -ne '000') { Format-OptionalResult '生态可达性' 'ok' "claude.ai:$r1 api:$r2" } else { Format-OptionalResult '生态可达性' 'fail' "claude.ai:$r1 api:$r2" }
+    }
 }
 
 function Invoke-Fix {
@@ -1416,22 +1572,50 @@ function Invoke-RulesStatus {
     Get-RulesStatus
 }
 
-switch ($args[0]) {
-    'checkdetail' {
-        $r = Invoke-CheckDetail
-        $r | Out-File -Encoding utf8 "$BASE\last-check.txt"
-        $r
+$command = if ($args.Count -gt 0) { [string]$args[0] } else { '' }
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$exitCode = 0
+$summary = ''
+try {
+    switch ($command) {
+        'checkdetail' {
+            $r = @(Invoke-CheckDetail)
+            $r | Out-File -Encoding utf8 "$BASE\last-check.txt"
+            $summary = (($r | ForEach-Object {
+                if ($_ -match '^([^=]+)=(ok|warn|fail|skip)(?::.*)?$') { "$($Matches[1])=$($Matches[2])" }
+            }) -join ' ')
+            $r
+        }
+        'status'       { Invoke-Status }
+        'fix' {
+            $r = @(Invoke-Fix)
+            $r | Out-File -Encoding utf8 "$BASE\last-fix.txt"
+            $r
+        }
+        'switch'       { Invoke-Switch $args[1] }
+        'set-region'   { Invoke-SetRegion }
+        'check-update' { Invoke-CheckUpdate }
+        'update-now'   { Invoke-UpdateNow }
+        'rules-status' { Invoke-RulesStatus }
+        'get-check-config' {
+            $config = Get-CheckConfig
+            [pscustomobject]@{ disabled = @($config.disabled); allowOptionalFailures = [bool]$config.allowOptionalFailures; logging = [bool]$config.logging } | ConvertTo-Json -Depth 3 -Compress
+        }
+        'set-check-config' {
+            Set-CheckConfigFromJson $args[1]
+            'OK:检查设置已保存'
+        }
+        'export-diagnostics' { Export-Diagnostics $args[1] }
+        default        {
+            $exitCode = 1
+            "用法: claude-switch.ps1 checkdetail|status|fix|switch A|B|set-region|check-update|update-now|rules-status|get-check-config|set-check-config|export-diagnostics"
+        }
     }
-    'status'       { Invoke-Status }
-    'fix' {
-        $r = @(Invoke-Fix)
-        $r | Out-File -Encoding utf8 "$BASE\last-fix.txt"
-        $r
-    }
-    'switch'       { Invoke-Switch $args[1] }
-    'set-region'   { Invoke-SetRegion }
-    'check-update' { Invoke-CheckUpdate }
-    'update-now'   { Invoke-UpdateNow }
-    'rules-status' { Invoke-RulesStatus }
-    default        { "用法: claude-switch.ps1 checkdetail|status|fix|switch A|B|set-region|check-update|update-now|rules-status" }
+} catch {
+    $exitCode = 1
+    Write-Error $_
+} finally {
+    $stopwatch.Stop()
+    Write-ClientLog $command $exitCode $stopwatch.ElapsedMilliseconds $summary
 }
+exit $exitCode

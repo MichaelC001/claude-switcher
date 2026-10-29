@@ -40,7 +40,7 @@ def read(path):
 def update_now_body():
     text = read(CORE)
     start = text.index("function Invoke-UpdateNow")
-    end = text.index("switch ($args[0])")
+    end = text.index("switch ($command)")
     return text[start:end]
 
 

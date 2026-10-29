@@ -83,7 +83,7 @@ class WindowsSwitchSafetyTests(unittest.TestCase):
 
     def test_client_language_is_not_hardcoded_ok(self):
         self.assertNotIn("客户端语言=ok:跟随系统", self.core)
-        self.assertIn("客户端语言=warn:", self.core)
+        self.assertIn("Format-OptionalResult '客户端语言' 'warn'", self.core)
         self.assertIn("CurrentUICulture", self.core)
 
     def test_claude_launch_falls_back_to_appx_aumid(self):

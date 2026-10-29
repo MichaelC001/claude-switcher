@@ -101,6 +101,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.claude-sw
 - **CN 拒绝**：出口国家为 `CN` 时 `set-region` 输出 `FAIL:出口国家为 CN,已中止`，不写入目标。
 - **不会每次检查自动跟随出口**：目标在安装或 `set-region` 时固定，避免节点切换时地区/时区来回变化；需要换区时显式运行 `set-region`。
 
+## 检查设置、客户端日志与诊断导出
+
+主窗口右上角「设置」可分别关闭 `IP一致`、`DNS`、`WebRTC`、`客户端语言`、`ASN属性`、`生态可达性` 这 6 项非关键检查。关闭后对应探测不会执行，界面以灰色 `skip` 显示，**不表示检查通过**。也可选择「将上述非关键项的失败降为警告」，只影响这 6 项，不会放宽出口国家一致性、代理/TUN、Kill-Switch、保镖、账号归档安全或其他硬性安全项。
+
+设置保存在 `%USERPROFILE%\.claude-switcher\checks.json`，也可通过核心命令读取和保存：
+
+```powershell
+claude-switch.ps1 get-check-config
+claude-switch.ps1 set-check-config '{"disabled":["DNS"],"allowOptionalFailures":false,"logging":true}'
+```
+
+脱敏客户端日志默认开启，位于 `%USERPROFILE%\.claude-switcher\logs\client.log`，达到 512 KiB 后轮转为 `client.log.1`。日志只记录命令、退出码、耗时和检查状态，不记录公网/住宅/代理 IP、Bearer/token/session/cookie、账号内容或 Clash 配置。点击主窗口「导出诊断」可生成 zip；也可以运行 `claude-switch.ps1 export-diagnostics <文件路径>`。诊断包只含客户端日志、检查设置和脱敏环境/状态摘要，不包含账号快照、`lastip`、`iphistory` 或原始 `last-check.txt`。
+
 ## 与 macOS 版的差异（注意事项）
 
 > macOS 版支持 Clash Verge / Shadowrocket / sing-box / ClashX / Surge 与地区自适应（按出口国家自动锁定时区+地区格式，换节点后 `set-region` 一键重配）。Windows 版已对齐多客户端检测与地区自适应，但 **Shadowrocket 仅 macOS 可用**；Windows 的时区映射覆盖美国主要时区、加拿大多伦多/温哥华、日本、韩国、新加坡、台湾、香港、英国、德国、法国、澳大利亚（悉尼/墨尔本）和马来西亚（吉隆坡），其他时区会回退到 `Eastern Standard Time`。地区格式由 `$LOCALE_TARGET` 控制，`set-region` 可重新探测出口并更新国家/时区/地区格式。macOS 的 `update` 命令与 12 小时自动检查、48 小时 IP 审查未移植到 Windows；Windows 另有一套启动检查 + 一键更新，见上文「更新」。

@@ -1,9 +1,10 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 // MARK: - 模型
 
-enum RowState { case pending, ok, warn, fail }
+enum RowState { case pending, ok, warn, fail, skip }
 
 struct CheckRow: Identifiable {
     let id = UUID()
@@ -76,6 +77,21 @@ final class VM: ObservableObject {
     @Published private(set) var coreMissing = false
     @Published private(set) var currentClient = ""
     @Published private(set) var isSwitchingClient = false
+    @Published var disabledChecks: Set<String> = []
+    @Published var allowOptionalFailures = false
+    @Published var loggingEnabled = true
+    @Published var settingsMessage = ""
+    @Published private(set) var settingsBusy = false
+    @Published var showSettingsSheet = false
+
+    static let optionalChecks: [(key: String, label: String)] = [
+        ("IP一致", "IP 与上次一致"),
+        ("DNS", "DNS 走隧道"),
+        ("WebRTC", "WebRTC"),
+        ("客户端语言", "客户端语言"),
+        ("ASN属性", "ASN 属性"),
+        ("生态可达性", "生态可达性"),
+    ]
 
     static let clientChoices: [(key: String, label: String)] = [
         ("clash-verge", "Clash Verge"),
@@ -221,6 +237,7 @@ final class VM: ObservableObject {
                 switch status.first ?? "" {
                 case "ok": self.rows[idx].state = .ok
                 case "warn": self.rows[idx].state = .warn
+                case "skip": self.rows[idx].state = .skip
                 default: self.rows[idx].state = .fail; allOk = false
                 }
                 self.rows[idx].detail = status.count > 1 ? status[1] : ""
@@ -237,7 +254,11 @@ final class VM: ObservableObject {
                 self.banner = "检测输出不完整(\(matched.count)/\(self.rows.count))，请点重新检查"
             }
             let passed = allOk && matched.count == self.rows.count
-            self.lastCheckSummary = passed ? (self.rows.contains { $0.state == .warn } ? "有警告" : "通过") : "失败"
+            self.lastCheckSummary = passed
+                ? (self.rows.contains { $0.state == .warn }
+                    ? "有警告"
+                    : (self.rows.contains { $0.state == .skip } ? "通过（含跳过）" : "通过"))
+                : "失败"
             self.run(["get-client"], timeout: self.checkTimeout) { clientResult in
                 self.updateClient(clientResult)
                 self.run(["status"], timeout: self.checkTimeout) { status in
@@ -307,6 +328,84 @@ final class VM: ObservableObject {
             if parts.count == 2 && parts[0] == "client" {
                 currentClient = parts[1]
             }
+        }
+    }
+
+    func loadCheckConfig() {
+        guard !settingsBusy, coreAvailable() else { return }
+        settingsBusy = true
+        settingsMessage = "正在读取设置…"
+        run(["get-check-config"]) { result in
+            self.settingsBusy = false
+            guard result.succeeded,
+                  let data = result.output.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data),
+                  let config = object as? [String: Any],
+                  let disabled = config["disabled"] as? [String],
+                  let allow = config["allowOptionalFailures"] as? Bool,
+                  let logging = config["logging"] as? Bool,
+                  Set(disabled).count == disabled.count,
+                  disabled.allSatisfy({ name in Self.optionalChecks.contains { $0.key == name } }) else {
+                self.settingsMessage = "读取检查设置失败，请恢复默认后重试"
+                return
+            }
+            self.disabledChecks = Set(disabled)
+            self.allowOptionalFailures = allow
+            self.loggingEnabled = logging
+            self.settingsMessage = ""
+        }
+    }
+
+    func saveCheckConfig() {
+        guard !isBusy, !settingsBusy, coreAvailable() else { return }
+        let allowed = Set(Self.optionalChecks.map { $0.key })
+        guard disabledChecks.isSubset(of: allowed) else {
+            settingsMessage = "包含不允许关闭的安全检查"
+            return
+        }
+        let config: [String: Any] = [
+            "disabled": Self.optionalChecks.map { $0.key }.filter { disabledChecks.contains($0) },
+            "allowOptionalFailures": allowOptionalFailures,
+            "logging": loggingEnabled,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: config, options: [.sortedKeys]),
+              let json = String(data: data, encoding: .utf8) else { return }
+        settingsBusy = true
+        settingsMessage = "正在保存…"
+        run(["set-check-config", json]) { result in
+            self.settingsBusy = false
+            self.settingsMessage = result.succeeded ? "设置已保存，正在重新检查" : result.output
+            if result.succeeded { self.refresh() }
+        }
+    }
+
+    func restoreCheckDefaults() {
+        disabledChecks = []
+        allowOptionalFailures = false
+        loggingEnabled = true
+        settingsMessage = "已恢复默认选项，点击保存后生效"
+    }
+
+    func exportDiagnostics() {
+        guard !settingsBusy, coreAvailable() else { return }
+        let panel = NSSavePanel()
+        panel.title = "导出脱敏诊断日志"
+        panel.message = "仅包含检查状态、设置和脱敏操作日志，不含 IP、凭据、账号或代理配置。"
+        panel.nameFieldStringValue = "claude-switcher-diagnostics.zip"
+        panel.allowedContentTypes = [.zip]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        settingsBusy = true
+        settingsMessage = "正在导出诊断日志…"
+        run(["export-diagnostics", destination.path], timeout: operationTimeout) { result in
+            self.settingsBusy = false
+            let message = result.succeeded ? result.output : "导出失败：\(result.output)"
+            self.settingsMessage = message
+            let alert = NSAlert()
+            alert.messageText = result.succeeded ? "诊断日志已导出" : "诊断日志导出失败"
+            alert.informativeText = message
+            alert.alertStyle = result.succeeded ? .informational : .warning
+            alert.runModal()
         }
     }
 
@@ -383,7 +482,7 @@ final class VM: ObservableObject {
 
         执行要求：
         1. 先读 AGENTS.md，按其中的安装步骤、验收标准与安全红线执行，不要只凭本段提示词猜测。
-        2. 安装或排障时先跑环境审计：14 项检查全部通过才算就绪；任何一项不过都不要启动 Claude。
+        2. 安装或排障时先跑环境审计：硬性安全项必须通过；只有显式配置的非关键项可跳过或降为警告，skip 不表示检查通过。
         3. 账号切换前先完全退出 Claude；账号快照按 AGENTS.md 的规则保留，不要改动 ~/.claude-switcher/accounts/ 的结构。
         4. 保镖等常驻脚本只放在 root 所有的系统目录，不要改回用户可写路径；需要变更时引导我重跑安装器。
         5. 不要未经我明确同意更新、覆盖或重装已安装版本（~/.local/bin、桌面 App、launchd 与系统目录），也不要执行 update 或安装器；先说明影响并征得同意。
@@ -564,6 +663,7 @@ struct ContentView: View {
             .padding(16)
         }
         .sheet(isPresented: $showAIPrompt) { AIPromptSheet(text: vm.aiPrompt) }
+        .sheet(isPresented: $vm.showSettingsSheet) { CheckSettingsView(vm: vm) }
         .frame(width: 440, height: height)
         .preferredColorScheme(.light)
     }
@@ -610,6 +710,13 @@ struct ContentView: View {
             ) {
                 showFingerprint = true
                 vm.inspectFingerprint()
+            }
+
+            ClaudeIconButton(
+                systemName: "gearshape",
+                help: "检查设置与诊断日志"
+            ) {
+                vm.showSettingsSheet = true
             }
 
             ClaudeIconButton(
@@ -743,6 +850,7 @@ struct ContentView: View {
             case .ok: Image(systemName: "checkmark.circle.fill").foregroundColor(ClaudeTheme.success)
             case .warn: Image(systemName: "exclamationmark.triangle.fill").foregroundColor(ClaudeTheme.warning)
             case .fail: Image(systemName: "xmark.octagon.fill").foregroundColor(ClaudeTheme.error)
+            case .skip: Image(systemName: "minus.circle").foregroundColor(ClaudeTheme.muted)
             }
         }
         .font(.callout)
@@ -898,7 +1006,7 @@ struct ContentView: View {
     var footer: some View {
         HStack(spacing: 10) {
             Image(systemName: "lock.shield").font(.caption2)
-            Text("任何一项检查不过，都不会启动 Claude").font(.caption2)
+            Text("硬性安全项必须通过；灰色跳过不表示检查通过").font(.caption2)
             Spacer()
             Button {
                 vm.checkUpdate()
@@ -916,6 +1024,93 @@ struct ContentView: View {
         }
         .foregroundColor(ClaudeTheme.muted)
         .sheet(isPresented: $vm.showUpdateSheet) { UpdateSheet(vm: vm) }
+    }
+}
+
+// MARK: - 检查设置与诊断
+
+struct CheckSettingsView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var vm: VM
+
+    var body: some View {
+        ZStack {
+            ClaudeBackground()
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("检查设置").font(.title3.bold()).foregroundColor(ClaudeTheme.ink)
+                        Text("安全项始终强制执行；跳过不等于通过").font(.caption).foregroundColor(ClaudeTheme.muted)
+                    }
+                    Spacer()
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark.circle.fill").font(.title2).foregroundColor(ClaudeTheme.muted)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("关闭")
+                }
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        GroupBox("可自定义的非关键检查") {
+                            VStack(alignment: .leading, spacing: 10) {
+                                ForEach(VM.optionalChecks, id: \.key) { item in
+                                    Toggle(item.label, isOn: Binding(
+                                        get: { !vm.disabledChecks.contains(item.key) },
+                                        set: { enabled in
+                                            if enabled { vm.disabledChecks.remove(item.key) }
+                                            else { vm.disabledChecks.insert(item.key) }
+                                        }
+                                    ))
+                                }
+                                Text("关闭后会真正跳过对应探测，并以灰色“已跳过”显示。出口国家、代理/TUN、Kill-Switch、保镖、账号归档和更新校验不可关闭。")
+                                    .font(.caption2).foregroundColor(ClaudeTheme.muted)
+                            }
+                            .padding(.vertical, 6)
+                        }
+
+                        GroupBox("失败处理与日志") {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Toggle("将上述非关键项的失败降为警告", isOn: $vm.allowOptionalFailures)
+                                Text("只影响这 6 项；不会放宽任何硬性安全项，也不会自动关闭检测。")
+                                    .font(.caption2).foregroundColor(ClaudeTheme.muted)
+                                Toggle("记录脱敏客户端日志", isOn: $vm.loggingEnabled)
+                                Text("仅记录版本、命令、退出码、耗时和检查状态，不记录 IP、凭据或账号内容。")
+                                    .font(.caption2).foregroundColor(ClaudeTheme.muted)
+                            }
+                            .padding(.vertical, 6)
+                        }
+
+                        GroupBox("问题排查") {
+                            VStack(alignment: .leading, spacing: 9) {
+                                Button("导出脱敏诊断日志…") { vm.exportDiagnostics() }
+                                    .disabled(vm.settingsBusy)
+                                Text("日志：~/Library/Logs/claude-switcher/client.log")
+                                    .font(.caption2).foregroundColor(ClaudeTheme.muted).textSelection(.enabled)
+                            }
+                            .padding(.vertical, 6)
+                        }
+                    }
+                }
+
+                if !vm.settingsMessage.isEmpty {
+                    Text(vm.settingsMessage).font(.caption).foregroundColor(ClaudeTheme.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                HStack {
+                    Button("恢复默认") { vm.restoreCheckDefaults() }.disabled(vm.settingsBusy)
+                    Spacer()
+                    if vm.settingsBusy { ProgressView().scaleEffect(0.65) }
+                    Button("保存并重新检查") { vm.saveCheckConfig() }
+                        .buttonStyle(.borderedProminent).tint(ClaudeTheme.terracottaDeep)
+                        .disabled(vm.settingsBusy || vm.isBusy)
+                }
+            }
+            .padding(20)
+        }
+        .frame(width: 520, height: 610)
+        .preferredColorScheme(.light)
+        .onAppear { vm.loadCheckConfig() }
     }
 }
 
@@ -1096,7 +1291,7 @@ struct NoticeView: View {
 
     let sections: [(String, String)] = [
         ("Full-Tunnel 全流量接管", "基于 TUN 虚拟网卡的内核级流量劫持，配合 Fake-IP DNS 解析机制，包括 UDP 在内的全部出站流量在网络栈底层被强制路由至加密隧道，应用层无法旁路。"),
-        ("Environment Audit 环境一致性审计", "每次启动前执行 14 项环境指纹审计：Egress IP 归属地与 ASN 属性、时区与 Geo-location 一致性、Locale、IPv6 双栈旁路、DNS Leak、WebRTC/STUN 多节点交叉探测等。任一指标不达标即 Block-on-Fail，杜绝带病启动。"),
+        ("Environment Audit 环境一致性审计", "每次启动前执行 14 项环境指纹审计：Egress IP 归属地与 ASN 属性、时区与 Geo-location 一致性、Locale、IPv6 双栈旁路、DNS Leak、WebRTC/STUN 多节点交叉探测等。硬性安全项失败即 Block-on-Fail；仅显式配置的非关键项可跳过或降级，skip 不表示通过。"),
         ("Kill-Switch 断网急停", "常驻守护进程以 10 秒周期巡检隧道健康度，隧道中断即刻终止受保护进程，将裸连窗口压缩到秒级。进程级急停，非防火墙级保证，边界详见 SECURITY.md。"),
         ("Pinned Routing 域名置顶路由", "目标服务全家族域名及其生态依赖（Turnstile 人机验证、Telemetry 遥测、Payment 支付、Support 组件）置顶锁定代理路由，优先级高于任何第三方分流规则集，免疫规则库误判。"),
         ("Session Isolation 会话隔离快照", "多账号采用完整快照隔离：各账号持有独立的 Device Fingerprint、OAuth Credential 与本地状态，切换即物理交换数据卷，账号间零交叉污染。"),
@@ -1245,6 +1440,12 @@ struct MenuBarContent: View {
             vm.checkUpdate()
             vm.showUpdateSheet = true
         }
+        Button("检查设置") {
+            showWindow()
+            vm.showSettingsSheet = true
+        }
+        Button("导出诊断日志") { vm.exportDiagnostics() }
+            .disabled(vm.settingsBusy)
         Divider()
         Button("退出 Claude 切换器") { NSApplication.shared.terminate(nil) }
             .keyboardShortcut("q")

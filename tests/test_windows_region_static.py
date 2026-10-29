@@ -59,7 +59,7 @@ class WindowsRegionStaticTests(unittest.TestCase):
 
     def test_update_now_preserves_five_configs(self):
         text = read(CORE)
-        body = between(text, "function Invoke-UpdateNow", "switch ($args[0])")
+        body = between(text, "function Invoke-UpdateNow", "switch ($command)")
         self.assertIn("5 项用户配置", body)
         for name in (
             "PROXY_MODE",

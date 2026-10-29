@@ -112,6 +112,7 @@ class SetClientTests(unittest.TestCase):
         check_fn = re.search(r"(?ms)^check\(\) \{\n.*?^\}", core).group(0)
         harness = r"""
 PROXY_MODE="shadowrocket"
+load_check_config() { return 0; }
 COUNTRY_TARGET="US"; TZ_TARGET="America/New_York"; LOCALE_TARGET="en_US"
 BASE="$HOME"
 proxy_alive() { return 0; }

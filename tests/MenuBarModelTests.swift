@@ -45,6 +45,8 @@ private final class Fixture {
           checkdetail) delay check; cat "$root/audit"; result check ;;
           status) cat "$root/status"; result status ;;
           get-client) echo 'client=clash-verge' ;;
+          get-check-config) cat "$root/check-config"; result get-config ;;
+          set-check-config) printf '%s\n' "$2" > "$root/saved-config"; result set-config ;;
           switch) delay switch; cat "$root/switch-output"; result switch ;;
           fix) delay fix; echo 'FIX:演示修复完成'; result fix ;;
           fingerprint) delay fingerprint; echo 'GPU=ok:演示设备' ;;
@@ -137,6 +139,32 @@ struct MenuBarModelTests {
                 try f.idle(vm)
                 try expect(vm.lastCheckSummary == "有警告" && vm.current == "B", "警告应展示并允许切换")
                 try expect(f.calls == ["checkdetail", "get-client", "status", "switch B"], "切换前必须先完整审计")
+            case "skipped_optional_allowed":
+                try f.audit(["DNS": "skip:用户已禁用", "WebRTC": "skip:用户已禁用"])
+                let vm = f.vm()
+                vm.switchTo("B")
+                try f.idle(vm)
+                try expect(vm.phase == .done && vm.current == "B", "显式跳过的非关键项不应阻断切换")
+                try expect(vm.rows.first { $0.name == "DNS 走隧道" }?.state == .skip, "跳过项必须显示 skip")
+            case "settings_round_trip":
+                try f.write("check-config", #"{"disabled":["DNS"],"allowOptionalFailures":true,"logging":false}"#)
+                let vm = f.vm()
+                vm.loadCheckConfig()
+                try spin { !vm.settingsBusy }
+                try expect(vm.disabledChecks == Set(["DNS"]), "应读取已禁用的 DNS 检查")
+                try expect(vm.allowOptionalFailures && !vm.loggingEnabled, "应读取非关键失败与日志设置")
+                vm.disabledChecks.insert("WebRTC")
+                vm.saveCheckConfig()
+                try spin { !vm.settingsBusy }
+                try f.idle(vm)
+                let saved = try String(contentsOf: f.root.appendingPathComponent("saved-config"), encoding: .utf8)
+                guard let data = saved.data(using: .utf8) else { throw TestFailure(description: "配置不是有效 UTF-8") }
+                let config = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                let disabled = config?["disabled"] as? [String]
+                try expect(Set(disabled ?? []) == Set(["DNS", "WebRTC"]), "保存必须保留已有禁用项并加入 WebRTC")
+                try expect(config?["allowOptionalFailures"] as? Bool == true, "保存必须保留非关键失败设置")
+                try expect(config?["logging"] as? Bool == false, "保存必须保留日志开关")
+                try expect(f.calls.contains("checkdetail"), "保存成功后必须重新检查")
             case "local_status_refresh":
                 let vm = f.vm()
                 vm.refreshAccountStatus()

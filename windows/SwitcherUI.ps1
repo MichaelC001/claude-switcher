@@ -90,7 +90,11 @@ $xaml = @"
                 <Button x:Name="BtnRefresh" Content="重新检查" Padding="18,8" FontWeight="Bold" Foreground="White" Background="#1AFFFFFF" BorderThickness="0" Cursor="Hand"/>
                 <Button x:Name="BtnCheckUpdate" Content="检查更新" Padding="18,8" Margin="10,0,0,0" FontWeight="Bold" Foreground="White" Background="#1AFFFFFF" BorderThickness="0" Cursor="Hand"/>
             </StackPanel>
-            <TextBlock Text="任何一项检查不过，都不会启动 Claude" FontSize="10" Foreground="#59FFFFFF" HorizontalAlignment="Center" Margin="0,14,0,0"/>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,10,0,0">
+                <Button x:Name="BtnSettings" Content="检查设置" Padding="16,6" Margin="0,0,10,0" FontSize="11" Foreground="#CCFFFFFF" Background="#14FFFFFF" BorderThickness="0" Cursor="Hand"/>
+                <Button x:Name="BtnDiagnostics" Content="导出诊断日志" Padding="16,6" FontSize="11" Foreground="#CCFFFFFF" Background="#14FFFFFF" BorderThickness="0" Cursor="Hand"/>
+            </StackPanel>
+            <TextBlock Text="硬性安全项必须通过；非关键项可显式跳过或忽略" FontSize="10" Foreground="#59FFFFFF" HorizontalAlignment="Center" Margin="0,14,0,0"/>
         </StackPanel>
     </Grid>
     </ScrollViewer>
@@ -112,19 +116,23 @@ function Set-Status($text, $color) {
 
 function Invoke-Core([string[]]$coreArgs) {
     # checkdetail/fix 改从落盘的 UTF-8 文件读取:子进程 stdout 经控制台代码页(如 GBK/936)转码会把中文弄乱
+    $script:lastCoreExit = 1
     if ($coreArgs[0] -eq 'checkdetail') {
         & powershell -NoProfile -ExecutionPolicy Bypass -File $CORE @coreArgs 2>$null | Out-Null
+        $script:lastCoreExit = $LASTEXITCODE
         return ((Get-Content "$BASE\last-check.txt" -Encoding UTF8) -join "`n").Trim()
     }
     if ($coreArgs[0] -eq 'fix') {
         Remove-Item -LiteralPath "$BASE\last-fix.txt" -Force -ErrorAction SilentlyContinue
         & powershell -NoProfile -ExecutionPolicy Bypass -File $CORE @coreArgs 2>$null | Out-Null
+        $script:lastCoreExit = $LASTEXITCODE
         if (Test-Path -LiteralPath "$BASE\last-fix.txt") {
             return ((Get-Content "$BASE\last-fix.txt" -Encoding UTF8) -join "`n").Trim()
         }
         return ''
     }
     $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $CORE @coreArgs 2>$null
+    $script:lastCoreExit = $LASTEXITCODE
     return ($out | Out-String).Trim()
 }
 
@@ -147,6 +155,7 @@ function Refresh-Checks {
                 switch ($st[0]) {
                     'ok'   { $rows[$i] = [pscustomobject]@{ Name = $rows[$i].Name; Detail = $d; Icon = '✓'; Color = '#FF22C55E' } }
                     'warn' { $rows[$i] = [pscustomobject]@{ Name = $rows[$i].Name; Detail = $d; Icon = '⚠'; Color = '#FFFACC15' } }
+                    'skip' { $rows[$i] = [pscustomobject]@{ Name = $rows[$i].Name; Detail = $d; Icon = '−'; Color = '#FF6B7280' } }
                     default { $rows[$i] = [pscustomobject]@{ Name = $rows[$i].Name; Detail = $d; Icon = '✗'; Color = '#FFF87171' }; $allOk = $false }
                 }
                 break
@@ -171,14 +180,148 @@ function Switch-To($t) {
     $win.FindName('Banner').Text = "正在切换到账号 $t…（归档约需几十秒）"
     $win.Dispatcher.Invoke([action]{}, 'Render')
     $r = Invoke-Core @('switch', $t)
-    if ($r -match '(?m)^FAIL:') {
+    if ($script:lastCoreExit -ne 0 -or $r -match '(?m)^FAIL:' -or $r -notmatch '(?m)^(OK|INFO):') {
         Set-Status '检查未过' ([System.Windows.Media.Color]::FromRgb(0xF8,0x71,0x71))
-        $win.FindName('Banner').Text = $r
+        $win.FindName('Banner').Text = if ($r) { $r } else { '切换未返回成功结果，请重新检查' }
     } else {
         $win.FindName('CurrentAccount').Text = $t
         Set-Status '完成' ([System.Windows.Media.Color]::FromRgb(0x22,0xC5,0x5E))
         $win.FindName('Banner').Foreground = (New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x22,0xC5,0x5E)))
         $win.FindName('Banner').Text = "已切换到账号 $t，Claude 启动中。"
+    }
+}
+
+function Show-CheckSettings {
+    $configJson = Invoke-Core @('get-check-config')
+    if ($script:lastCoreExit -ne 0 -or [string]::IsNullOrWhiteSpace($configJson)) {
+        [void][System.Windows.MessageBox]::Show('无法读取检查设置，请确认核心脚本已更新。', '检查设置')
+        return
+    }
+    try { $config = $configJson | ConvertFrom-Json -ErrorAction Stop } catch {
+        [void][System.Windows.MessageBox]::Show('检查设置格式无效，请恢复默认设置。', '检查设置')
+        return
+    }
+    $settingsXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="检查设置" Width="520" Height="650" ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner" Background="#FF12141D" Foreground="White">
+    <Grid Margin="22">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <StackPanel Grid.Row="0" Margin="0,0,0,14">
+            <TextBlock Text="检查设置" FontSize="20" FontWeight="Bold"/>
+            <TextBlock Text="硬性安全项始终执行；跳过不等于通过" FontSize="11" Foreground="#99FFFFFF" Margin="0,4,0,0"/>
+        </StackPanel>
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+                <Border CornerRadius="10" Background="#0DFFFFFF" Padding="14" Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock Text="可自定义的非关键检查" FontWeight="Bold" Margin="0,0,0,10"/>
+                        <CheckBox x:Name="Check_IP" Content="IP 与上次一致" Margin="0,5"/>
+                        <CheckBox x:Name="Check_DNS" Content="DNS 走隧道" Margin="0,5"/>
+                        <CheckBox x:Name="Check_WebRTC" Content="WebRTC" Margin="0,5"/>
+                        <CheckBox x:Name="Check_Locale" Content="客户端语言" Margin="0,5"/>
+                        <CheckBox x:Name="Check_ASN" Content="ASN 属性" Margin="0,5"/>
+                        <CheckBox x:Name="Check_Eco" Content="生态可达性" Margin="0,5"/>
+                        <TextBlock Text="关闭后会真正跳过探测，并以灰色显示。出口国家、代理/TUN、Kill-Switch、保镖、账号归档和更新校验不可关闭。" FontSize="11" Foreground="#99FFFFFF" TextWrapping="Wrap" Margin="0,8,0,0"/>
+                    </StackPanel>
+                </Border>
+                <Border CornerRadius="10" Background="#0DFFFFFF" Padding="14" Margin="0,0,0,12">
+                    <StackPanel>
+                        <CheckBox x:Name="CheckAllow" Content="将上述非关键项的失败降为警告" Margin="0,5"/>
+                        <TextBlock Text="只影响以上 6 项，不放宽硬性安全项，也不会自动关闭检测。" FontSize="11" Foreground="#99FFFFFF" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                        <CheckBox x:Name="CheckLogging" Content="记录脱敏客户端日志" Margin="0,5"/>
+                        <TextBlock Text="仅记录版本、命令、退出码、耗时和检查状态，不记录 IP、凭据或账号内容。" FontSize="11" Foreground="#99FFFFFF" TextWrapping="Wrap"/>
+                    </StackPanel>
+                </Border>
+                <Border CornerRadius="10" Background="#0DFFFFFF" Padding="14">
+                    <StackPanel>
+                        <Button x:Name="BtnExportInSettings" Content="导出脱敏诊断日志…" Padding="12,7" HorizontalAlignment="Left" Foreground="White" Background="#1AFFFFFF" BorderThickness="0" Cursor="Hand"/>
+                        <TextBlock Text="%USERPROFILE%\.claude-switcher\logs\client.log" FontSize="10" Foreground="#80FFFFFF" Margin="0,8,0,0"/>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
+        <StackPanel Grid.Row="2" Margin="0,14,0,0">
+            <TextBlock x:Name="SettingsMessage" Text="" FontSize="11" Foreground="#FFFACC15" TextWrapping="Wrap" Margin="0,0,0,8"/>
+            <StackPanel Orientation="Horizontal">
+                <Button x:Name="BtnDefaults" Content="恢复默认" Padding="12,7" Foreground="White" Background="#1AFFFFFF" BorderThickness="0" Cursor="Hand"/>
+                <Button x:Name="BtnSaveSettings" Content="保存并重新检查" Padding="12,7" Margin="12,0,0,0" FontWeight="Bold" Foreground="White" Background="#FF6366F1" BorderThickness="0" Cursor="Hand"/>
+            </StackPanel>
+        </StackPanel>
+    </Grid>
+</Window>
+"@
+    try {
+        $settingsReader = New-Object System.Xml.XmlNodeReader ([xml]$settingsXaml)
+        $settingsWin = [Windows.Markup.XamlReader]::Load($settingsReader)
+        $settingsWin.Owner = $win
+    } catch {
+        [void][System.Windows.MessageBox]::Show('无法打开检查设置窗口。', '检查设置')
+        return
+    }
+    $map = @(
+        @{ Name = 'IP一致'; Control = 'Check_IP' },
+        @{ Name = 'DNS'; Control = 'Check_DNS' },
+        @{ Name = 'WebRTC'; Control = 'Check_WebRTC' },
+        @{ Name = '客户端语言'; Control = 'Check_Locale' },
+        @{ Name = 'ASN属性'; Control = 'Check_ASN' },
+        @{ Name = '生态可达性'; Control = 'Check_Eco' }
+    )
+    $disabled = @($config.disabled)
+    foreach ($item in $map) {
+        $settingsWin.FindName($item.Control).IsChecked = ($disabled -notcontains $item.Name)
+    }
+    $settingsWin.FindName('CheckAllow').IsChecked = [bool]$config.allowOptionalFailures
+    $settingsWin.FindName('CheckLogging').IsChecked = [bool]$config.logging
+    $settingsWin.FindName('BtnDefaults').Add_Click({
+        foreach ($item in $map) { $settingsWin.FindName($item.Control).IsChecked = $true }
+        $settingsWin.FindName('CheckAllow').IsChecked = $false
+        $settingsWin.FindName('CheckLogging').IsChecked = $true
+        $settingsWin.FindName('SettingsMessage').Text = '已恢复默认选项，点击保存后生效'
+    })
+    $settingsWin.FindName('BtnSaveSettings').Add_Click({
+        $newDisabled = @()
+        foreach ($item in $map) {
+            if ($settingsWin.FindName($item.Control).IsChecked -ne $true) { $newDisabled += $item.Name }
+        }
+        $newConfig = [pscustomobject]@{
+            disabled = @($newDisabled)
+            allowOptionalFailures = [bool]$settingsWin.FindName('CheckAllow').IsChecked
+            logging = [bool]$settingsWin.FindName('CheckLogging').IsChecked
+        }
+        $json = $newConfig | ConvertTo-Json -Depth 3 -Compress
+        $saveButton = $settingsWin.FindName('BtnSaveSettings')
+        $saveButton.IsEnabled = $false
+        $saveResult = Invoke-Core @('set-check-config', $json)
+        $saveExit = $script:lastCoreExit
+        $saveButton.IsEnabled = $true
+        if ($saveExit -ne 0 -or $saveResult -notmatch '(?m)^OK:') {
+            $settingsWin.FindName('SettingsMessage').Text = '保存失败，请检查配置后重试'
+            return
+        }
+        $settingsWin.FindName('SettingsMessage').Text = '设置已保存，正在重新检查'
+        Refresh-Checks
+    })
+    $settingsWin.FindName('BtnExportInSettings').Add_Click({ Export-DiagnosticLog })
+    [void]$settingsWin.ShowDialog()
+}
+
+function Export-DiagnosticLog {
+    $dialog = New-Object Microsoft.Win32.SaveFileDialog
+    $dialog.Title = '导出脱敏诊断日志'
+    $dialog.FileName = 'claude-switcher-diagnostics.zip'
+    $dialog.DefaultExt = '.zip'
+    $dialog.Filter = 'ZIP 压缩包|*.zip'
+    $dialog.AddExtension = $true
+    if ($dialog.ShowDialog() -ne $true) { return }
+    $result = Invoke-Core @('export-diagnostics', $dialog.FileName)
+    if ($script:lastCoreExit -eq 0 -and $result -match '(?m)^OK:') {
+        [void][System.Windows.MessageBox]::Show($result, '诊断日志已导出')
+    } else {
+        [void][System.Windows.MessageBox]::Show('诊断日志导出失败，请重试。', '导出失败')
     }
 }
 
@@ -366,6 +509,8 @@ $win.FindName('BtnFix').Add_Click({
 })
 $win.FindName('BtnA').Add_Click({ Switch-To 'A' })
 $win.FindName('BtnB').Add_Click({ Switch-To 'B' })
+$win.FindName('BtnSettings').Add_Click({ Show-CheckSettings })
+$win.FindName('BtnDiagnostics').Add_Click({ Export-DiagnosticLog })
 
 $win.FindName('BtnCheckUpdate').Add_Click({
     if ($script:updateRunning) { return }
