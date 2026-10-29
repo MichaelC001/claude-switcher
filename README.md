@@ -100,7 +100,7 @@ AI 服务平台的风控已经从"看 IP"进化到**全维度环境画像**：�
 
 ## 安装
 
-**系统要求**：macOS · Clash Verge / Shadowrocket / sing-box / ClashX / Surge 任一（TUN 可用）· Claude 桌面版 · python3
+**系统要求**：macOS · Clash Verge / FlClash / Shadowrocket / sing-box / ClashX / Surge 任一（TUN 可用）· Claude 桌面版 · python3
 
 > **Windows 用户**：[`windows/`](windows/) 目录提供 Windows 版（PowerShell + WPF，Beta），安装与注意事项见 [windows/README.md](windows/README.md)。
 > **Linux 用户**：[`linux/`](linux/) 目录提供 Linux 版（bash + systemd，Beta），设计取舍（无官方桌面版→切换浏览器登录态）见 [linux/README.md](linux/README.md)。
@@ -144,6 +144,7 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 2. 全绿 → 选账号启动；有红项 → 「一键修复」自动处理
 3. B/C/D 账号首次使用登录一次，以后 A–D 随切随用、互不干扰
 4. 换了其他国家的节点 → 跑一次 `~/.local/bin/claude-switch.sh set-region`，国家/时区/地区格式一键重新锁定
+5. 换了代理客户端 → 在界面「代理客户端」下拉菜单选中即可切换（或 `set-client` 命令），切换后自动重新审计
 
 ### macOS 菜单栏常驻
 
@@ -263,14 +264,15 @@ skills/
 
 ## 更换代理客户端（macOS）
 
-安装时选错了客户端、或后来从 Clash Verge 换到 Shadowrocket 等，可以先更改核心配置；**如果已安装 root 保镖，还必须重新运行安装器同步其模式**（不会由用户态命令直接改写 root 文件）：
+安装时选错了客户端、或后来从 Clash Verge 换到 FlClash / Shadowrocket 等，可以直接在 App 界面的「代理客户端」下拉菜单里切换（选中即生效并自动重新审计）；也可以先改核心配置。**如果已安装 root 保镖，切换后还必须重新运行安装器同步其模式**（不会由用户态命令直接改写 root 文件）：
 
 ```bash
-~/.local/bin/claude-switch.sh set-client shadowrocket
+~/.local/bin/claude-switch.sh set-client flclash
 ```
 
-支持 `clash-verge|shadowrocket|sing-box|clashx|surge|auto`。改完重新跑一次 `checkdetail` 即可：
+支持 `clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto`。改完重新跑一次 `checkdetail` 即可：
 
+- 换成 FlClash 后，「代理内核」检查 `FlClashCore`/`FlClash` 进程；WebRTC 判定采用 FlClash 的 STUN/TURN UDP REJECT 规则（探测无响应视为已拒绝，不误报）
 - 换成 Shadowrocket 后，「代理内核」检查 `scutil --nc` 的连接状态，不再去找 Clash Verge
 - 非 Clash 客户端不做配置改写，「规则置顶」改用 fake-ip 行为检测；不通过时按提示在客户端里手动添加 Claude 域名规则
 - 「保镖」现在会核对运行中 LaunchDaemon 与 root 所有的保镖脚本内 `MODE`，不再只看进程是否存在；客户端模式不一致时显示 `fail:客户端不一致`，此时需手动重跑 `installer/安装.command` 同步保镖（需要管理员权限）。`fix` 只能启动缺失的 LaunchDaemon，**不会更新已有 root 脚本内的旧模式**；在重新检查通过前不要启动 Claude。
@@ -408,7 +410,7 @@ Bug 反馈和功能建议仍建议提交 Issue，便于跟踪与处理。
 - [ ] Linux 版稳定化：多客户端/地区自适应/COW 快照已落地（桩测试通过），多发行版真机回归持续进行
 - [x] Web 版环境检测页：手机/平板浏览器打开即测，零安装
 - [x] 更多指纹维度：桌面端 `fingerprint` 命令覆盖字体地区特征 + GPU/虚拟机特征，Canvas/WebGL 由 Web 检测页覆盖
-- [x] 更多代理客户端适配：已支持 Clash Verge / Shadowrocket / sing-box / ClashX / Surge（含 auto 自动识别）
+- [x] 更多代理客户端适配：已支持 Clash Verge / FlClash / Shadowrocket / sing-box / ClashX / Surge（含 auto 自动识别），并可在 App 内下拉一键切换
 - [x] 快照切换提速：归档改为同卷移动 + 载入走 COW 克隆（APFS clonefile / Linux reflink），不再产生全量复制
 - [x] 应用内自动更新：launchd 每 12 小时自动检查更新，自检失败自动回滚，也可手动 `claude-switch.sh update` 保底
 

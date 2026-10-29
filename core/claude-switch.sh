@@ -529,7 +529,7 @@ PY_CLASH_RULES
 fi
 
 # ============ 安装时可配置项(安装程序会自动改写) ============
-PROXY_MODE="clash-verge"       # 代理客户端: clash-verge|shadowrocket|sing-box|clashx|surge|auto
+PROXY_MODE="clash-verge"       # 代理客户端: clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto
 PROXY_GROUP="IpEqual"          # Clash 代理组名(安装时自动探测)
 COUNTRY_TARGET="US"            # 目标出口国家(安装时按出口自动识别)
 TZ_TARGET="America/New_York"   # 锁定时区,应与出口IP所在城市一致
@@ -553,6 +553,7 @@ tun_up() { ifconfig 2>/dev/null | grep -q 'inet 198\.18\.'; }
 proxy_name() {
     case "$PROXY_MODE" in
         clash-verge)  echo "Clash Verge" ;;
+        flclash)      echo "FlClash" ;;
         shadowrocket) echo "Shadowrocket" ;;
         sing-box)     echo "sing-box" ;;
         clashx)       echo "ClashX" ;;
@@ -566,6 +567,7 @@ proxy_name() {
 proxy_app_name() {
     case "$PROXY_MODE" in
         clash-verge)  echo "Clash Verge" ;;
+        flclash)      echo "FlClash" ;;
         shadowrocket) echo "Shadowrocket" ;;
         clashx)       echo "ClashX" ;;
         surge)        echo "Surge" ;;
@@ -587,6 +589,7 @@ shadowrocket_up() {
 proxy_alive() {
     case "$PROXY_MODE" in
         clash-verge)  pgrep -f verge-mihomo >/dev/null 2>&1 ;;
+        flclash)      pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1 ;;
         shadowrocket) shadowrocket_up ;;
         sing-box)     pgrep -f sing-box >/dev/null 2>&1 ;;
         clashx)       pgrep -x ClashX >/dev/null 2>&1 || pgrep -f clash >/dev/null 2>&1 ;;
@@ -850,6 +853,25 @@ webrtc_test() {
 # 日常检查与修复共用此判断。先确认规则，再允许探测，避免向已知直连路径发包。
 webrtc_status() {
     local verified result probe_rc assessment mode leak wips w
+    # FlClash 当前采用明确的 STUN/TURN UDP REJECT 规则；无响应表示已被拒绝，
+    # 不把它误报成"无法确认"。若节点实际返回地址，必须与当前代理出口一致。
+    if [ "$PROXY_MODE" = "flclash" ]; then
+        result=$(webrtc_test)
+        probe_rc=$?
+        [ "$probe_rc" -ne 0 ] && { echo "fail:STUN 探测执行失败，未确认 UDP 出口"; return; }
+        case "$result" in
+            RESULT:NONE) echo 'ok:FlClash 已按规则拒绝 STUN UDP，未发现直连地址' ;;
+            RESULT:*)
+                leak=""
+                wips=${result#RESULT:}
+                OLDIFS=$IFS; IFS=','
+                for w in $wips; do [ -n "$1" ] && [ "$w" != "$1" ] && leak="$leak $w"; done
+                IFS=$OLDIFS
+                if [ -n "$leak" ]; then echo "fail:STUN 暴露非代理IP:${leak# }"; else echo 'ok:STUN 仅返回代理出口地址'; fi ;;
+            *) echo 'fail:STUN 探测结果格式异常' ;;
+        esac
+        return
+    fi
     if [ "$PROXY_MODE" = "clash-verge" ]; then
         mode=$(clash_mode)
         # 全局模式不经过规则匹配,直接按"STUN 结果是否等于当前出口"判断
@@ -1173,8 +1195,8 @@ ASEOF
 set_client() {
     mode="${1:-}"
     case "$mode" in
-        clash-verge|shadowrocket|sing-box|clashx|surge|auto) ;;
-        *) echo "FAIL:用法: claude-switch.sh set-client <clash-verge|shadowrocket|sing-box|clashx|surge|auto>"; return 1 ;;
+        clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto) ;;
+        *) echo "FAIL:用法: claude-switch.sh set-client <clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto>"; return 1 ;;
     esac
     target="${CLAUDE_SWITCHER_CORE:-}"
     if [ -z "$target" ]; then
@@ -1196,6 +1218,12 @@ set_client() {
     esac
     echo "INFO:重新运行 checkdetail 生效;非 Clash 客户端请在应用内自行添加 Claude 域名置顶规则"
     return 0
+}
+
+# 只读输出当前代理客户端(供 UI 下拉高亮),同时列出全部支持项
+get_client() {
+    echo "client=$PROXY_MODE"
+    echo "clients=clash-verge,flclash,shadowrocket,sing-box,clashx,surge"
 }
 
 # 地区自适应:按当前出口国家一键重设 国家/时区/地区格式(换了国家节点后运行)
@@ -1884,6 +1912,7 @@ case "${1:-}" in
     switch) switch_to "${2:-}" ;;
     set-region) set_region ;;
     set-client) set_client "${2:-}" ;;
+    get-client) get_client ;;
     update) self_update "${2:-}" ;;
     update-check) self_update --check ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
     open-safe) open_safe "${2:-}" ;;

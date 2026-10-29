@@ -74,6 +74,17 @@ final class VM: ObservableObject {
     @Published var updateText = ""
     @Published var showUpdateSheet = false
     @Published private(set) var coreMissing = false
+    @Published private(set) var currentClient = ""
+    @Published private(set) var isSwitchingClient = false
+
+    static let clientChoices: [(key: String, label: String)] = [
+        ("clash-verge", "Clash Verge"),
+        ("flclash", "FlClash"),
+        ("shadowrocket", "Shadowrocket"),
+        ("sing-box", "sing-box"),
+        ("clashx", "ClashX"),
+        ("surge", "Surge"),
+    ]
 
     let core: String
     private let checkTimeout: TimeInterval
@@ -227,16 +238,19 @@ final class VM: ObservableObject {
             }
             let passed = allOk && matched.count == self.rows.count
             self.lastCheckSummary = passed ? (self.rows.contains { $0.state == .warn } ? "有警告" : "通过") : "失败"
-            self.run(["status"], timeout: self.checkTimeout) { status in
-                let statusOK = self.updateStatus(status)
-                if !statusOK {
-                    if !passed || self.banner.isEmpty {
-                        self.banner = "无法读取账号状态，请重新检查"
+            self.run(["get-client"], timeout: self.checkTimeout) { clientResult in
+                self.updateClient(clientResult)
+                self.run(["status"], timeout: self.checkTimeout) { status in
+                    let statusOK = self.updateStatus(status)
+                    if !statusOK {
+                        if !passed || self.banner.isEmpty {
+                            self.banner = "无法读取账号状态，请重新检查"
+                        }
+                        self.lastCheckSummary = "失败"
                     }
-                    self.lastCheckSummary = "失败"
+                    self.phase = passed && statusOK ? .ready : .failed
+                    done(passed && statusOK)
                 }
-                self.phase = passed && statusOK ? .ready : .failed
-                done(passed && statusOK)
             }
         }
     }
@@ -285,6 +299,37 @@ final class VM: ObservableObject {
     }
 
     static let accountLetters = ["A", "B", "C", "D"]
+
+    private func updateClient(_ result: CoreResult) {
+        guard result.succeeded else { return }
+        for line in result.output.split(separator: "\n") {
+            let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            if parts.count == 2 && parts[0] == "client" {
+                currentClient = parts[1]
+            }
+        }
+    }
+
+    func setClient(_ key: String) {
+        guard !isBusy, !isSwitchingClient else { return }
+        guard Self.clientChoices.contains(where: { $0.key == key }) else { return }
+        guard key != currentClient else { return }
+        guard coreAvailable() else { markCoreMissing(); return }
+        isBusy = true
+        isSwitchingClient = true
+        banner = "正在切换代理客户端…"
+        run(["set-client", key], timeout: operationTimeout) { result in
+            self.isSwitchingClient = false
+            guard result.succeeded else {
+                self.banner = result.output
+                self.isBusy = false
+                return
+            }
+            // 切换后重新完成环境审计,刷新「代理内核」等检查项
+            self.currentClient = key
+            self.checkEnvironment { _ in self.isBusy = false }
+        }
+    }
 
     func fixAll() {
         guard !isBusy else { return }
@@ -503,6 +548,7 @@ struct ContentView: View {
                 ScrollView {
                     VStack(spacing: 16) {
                         checksCard
+                        clientCard
                         if vm.phase == .ready || vm.phase == .switching || vm.phase == .done {
                             accountCard
                         } else if vm.coreMissing {
@@ -652,6 +698,42 @@ struct ContentView: View {
 
     private func isMonospace(_ str: String) -> Bool {
         str.contains(".") || str.contains(":") || str.contains("/")
+    }
+
+    var clientCard: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(ClaudeTheme.iconWell)
+                    .frame(width: 24, height: 24)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(ClaudeTheme.divider, lineWidth: 0.5))
+                Image(systemName: "network")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundColor(ClaudeTheme.muted)
+            }
+            Text("代理客户端").font(.system(size: 13, weight: .medium)).foregroundColor(ClaudeTheme.ink)
+            Spacer()
+            if vm.isSwitchingClient {
+                ProgressView().scaleEffect(0.6).frame(width: 16, height: 16)
+            }
+            Picker("", selection: Binding(
+                get: { vm.currentClient },
+                set: { vm.setClient($0) }
+            )) {
+                ForEach(VM.clientChoices, id: \.key) { choice in
+                    Text(choice.label).tag(choice.key)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 150)
+            .disabled(vm.isBusy || vm.isSwitchingClient)
+        }
+        .padding(.vertical, 7)
+        .padding(.horizontal, 12)
+        .background(ClaudeTheme.card)
+        .clipShape(RoundedRectangle(cornerRadius: 13))
+        .overlay(RoundedRectangle(cornerRadius: 13).stroke(ClaudeTheme.cardBorder, lineWidth: 1))
+        .shadow(color: Color(red: 0.2, green: 0.16, blue: 0.12).opacity(0.035), radius: 6, x: 0, y: 2)
     }
 
     func stateIcon(_ s: RowState) -> some View {
