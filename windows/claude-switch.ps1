@@ -1305,9 +1305,77 @@ function Stop-ClaudeApp {
     return $false
 }
 
-# 数据目录换位:新目录先备好,再用两次 rename 提交;失败回滚，任何时候都不先删当前数据
-function Switch-DataDir([string]$Stage) {
-    $old = "$DATA.old"
+function Get-SwitchStagePath {
+    $baseRoot = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($BASE)).TrimEnd('\')
+    $dataRoot = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($DATA)).TrimEnd('\')
+    if ($baseRoot -ieq $dataRoot) { return "$BASE\staging\Claude.new" }
+    return "$DATA.new"
+}
+
+function Get-SwitchPreviousPath {
+    $baseRoot = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($BASE)).TrimEnd('\')
+    $dataRoot = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($DATA)).TrimEnd('\')
+    if ($baseRoot -ieq $dataRoot) { return "$BASE\staging\Claude.old" }
+    return "$DATA.old"
+}
+
+function Write-AtomicCurrent([string]$Target) {
+    $tmp = Join-Path $BASE ('.current-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        [IO.File]::WriteAllText($tmp, $Target, [Text.Encoding]::ASCII)
+        Move-Item -LiteralPath $tmp -Destination "$BASE\current.txt" -Force -ErrorAction Stop
+        return $true
+    } catch {
+        return (Set-SwitchError "账号指针写入失败:$($_.Exception.Message)")
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Register-OwnedSwitchCleanup([string]$Path, [string]$Target) {
+    $marker = "$BASE\staging\cleanup.json"
+    try {
+        $value = [ordered]@{ version = 1; path = $Path; target = $Target }
+        [IO.File]::WriteAllText($marker, ($value | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
+    } catch {
+        Log "WARN:旧目录清理归属标记写入失败:$($_.Exception.Message)"
+    }
+}
+
+function Resolve-OwnedSwitchCleanup([string]$Path) {
+    $marker = "$BASE\staging\cleanup.json"
+    if (-not (Test-Path -LiteralPath $Path) -and -not (Test-Path -LiteralPath $marker)) { return $true }
+    $current = if (Test-Path "$BASE\current.txt") { (Get-Content "$BASE\current.txt" -Raw).Trim() } else { '' }
+    $valid = $false
+    if (Test-Path -LiteralPath $marker -PathType Leaf) {
+        try {
+            $record = (Get-Content -LiteralPath $marker -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
+            $valid = [int]$record.version -eq 1 -and [string]$record.path -eq $Path -and [string]$record.target -eq $current
+        } catch { $valid = $false }
+    }
+    if ($valid) {
+        if (-not (Test-Path -LiteralPath $Path)) {
+            Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+            return $true
+        }
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            Remove-Item -LiteralPath $marker -Force -ErrorAction Stop
+            return $true
+        } catch {
+            return (Set-SwitchError "已确认归属的旧目录仍无法清理:$Path；请关闭占用程序后重试")
+        }
+    }
+    if (Test-Path -LiteralPath $Path) {
+        return (Set-SwitchError "存在待恢复数据，拒绝覆盖:$Path(确认数据归属后手动恢复或清理)")
+    }
+    return $true
+}
+
+# 数据目录换位:新目录先备好,再提交数据和账号指针;失败回滚，任何时候都不先删当前数据
+function Switch-DataDir([string]$Stage, [string]$Target) {
+    $old = Get-SwitchPreviousPath
+    if (-not (Resolve-OwnedSwitchCleanup $old)) { return $false }
     if (Test-Path -LiteralPath $old) {
         return (Set-SwitchError "存在待恢复数据，拒绝覆盖:$old(确认数据归属后手动恢复或清理)")
     }
@@ -1324,7 +1392,23 @@ function Switch-DataDir([string]$Stage) {
         }
         return (Set-SwitchError "新数据目录提交失败，已回滚:$commitError")
     }
-    if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction Stop }
+    if (-not (Write-AtomicCurrent $Target)) {
+        $pointerError = $script:SwitchError
+        try {
+            if (Test-Path -LiteralPath $DATA) { Move-Item -LiteralPath $DATA -Destination $Stage -ErrorAction Stop }
+            if (Test-Path -LiteralPath $old) { Move-Item -LiteralPath $old -Destination $DATA -ErrorAction Stop }
+        } catch {
+            return (Set-SwitchError "$pointerError；回滚未完成，恢复材料保留在:$Stage 和 $old")
+        }
+        return (Set-SwitchError "$pointerError；已回滚")
+    }
+    if (Test-Path -LiteralPath $old) {
+        try { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction Stop }
+        catch {
+            Register-OwnedSwitchCleanup $old $Target
+            "WARN:目标账号已切换，旧目录暂未清理；已记录归属，下次切换会先重试清理"
+        }
+    }
     return $true
 }
 
@@ -1365,10 +1449,10 @@ function Save-Account([string]$name) {
     return $true
 }
 
-# 载入快照:先复制到 Claude.new，再整体换位;提交前当前数据始终保留
+# 载入快照:先复制到事务暂存区，再整体换位;提交前当前数据始终保留
 function Load-Account([string]$name) {
     $source = "$BASE\accounts\$name"
-    $stage = "$DATA.new"
+    $stage = Get-SwitchStagePath
     if (-not (Test-Path -LiteralPath $source)) { return (Set-SwitchError "账号$name 没有可用快照") }
     if (Test-Path -LiteralPath $stage) {
         return (Set-SwitchError "存在待恢复数据，拒绝覆盖:$stage(确认数据归属后手动恢复或清理)")
@@ -1379,24 +1463,21 @@ function Load-Account([string]$name) {
         Log "FAIL:账号$name 存档载入失败(robocopy $($rc.code))"
         return (Set-SwitchError "账号$name 存档载入失败(robocopy $($rc.code))，当前数据未改动")
     }
-    if (-not (Switch-DataDir $stage)) {
-        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
-        return $false
-    }
+    if (-not (Switch-DataDir $stage $name)) { return $false }
     Log "已载入账号$name 存档"
     return $true
 }
 
 # 空槽位:用空目录换位，不先删当前数据
 function New-AccountData([string]$name) {
-    $stage = "$DATA.new"
+    $stage = Get-SwitchStagePath
     if (Test-Path -LiteralPath $stage) {
         return (Set-SwitchError "存在待恢复数据，拒绝覆盖:$stage(确认数据归属后手动恢复或清理)")
     }
     if (-not (New-Item -ItemType Directory -Force -Path $stage -ErrorAction SilentlyContinue)) {
         return (Set-SwitchError "无法创建账号$name 数据目录")
     }
-    if (-not (Switch-DataDir $stage)) { return $false }
+    if (-not (Switch-DataDir $stage $name)) { return $false }
     Log "账号$name 无存档，已初始化为全新状态"
     return $true
 }
@@ -1574,7 +1655,6 @@ function Invoke-Switch($target) {
     } else {
         if (-not (New-AccountData $target)) { Write-SwitchFailure $script:SwitchError; return }
     }
-    $target | Out-File -Encoding ascii -NoNewline "$BASE\current.txt"
     if ((Test-Path "$BASE\keep-stage") -and -not (Restore-KeepPaths)) {
         Write-SwitchFailure $script:SwitchError; return
     }

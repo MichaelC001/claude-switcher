@@ -46,8 +46,15 @@ class WindowsSwitchSafetyTests(unittest.TestCase):
             re.search(r"Remove-Item[^\n]*\s\$DATA(?![\w.])", self.core),
             "切换路径不得直接删除当前数据目录",
         )
-        self.assertIn('$stage = "$DATA.new"', self.core)
-        self.assertIn('$old = "$DATA.old"', self.core)
+        self.assertIn('function Get-SwitchStagePath', self.core)
+        self.assertIn('function Get-SwitchPreviousPath', self.core)
+        self.assertIn('"$BASE\\staging\\Claude.new"', self.core)
+        self.assertIn('"$BASE\\staging\\Claude.old"', self.core)
+        self.assertIn('Resolve-OwnedSwitchCleanup', self.core)
+        commit = self.core.index("function Switch-DataDir")
+        cleanup = self.core.index("Remove-Item -LiteralPath $old", commit)
+        pointer = self.core.index("Write-AtomicCurrent", commit)
+        self.assertLess(pointer, cleanup, "账号指针必须在旧目录清理前与实际数据一起提交")
 
     def test_interrupted_switch_artifacts_are_never_deleted(self):
         for name in ("Load-Account", "New-AccountData"):

@@ -122,6 +122,8 @@ claude-switch.ps1 set-check-config '{"disabled":["DNS"],"allowOptionalFailures":
 
 主窗口支持 A–D 四个账号卡片，显示当前账号、已建档状态、快照大小和归档日期。每次切换前会重新完成 14 项审计；输出不完整、硬性项失败或另一操作仍在进行时不会切换。`status` 与 `switch A|B|C|D` 也可在命令行使用，`check` 提供静默总检。启用 `IP一致` 时会维护最近 48 小时出口历史，不同出口达到 3 个会给出警告；禁用该项后不记录这段历史。
 
+同盘安装时，切换暂存和旧目录备份位于 `%USERPROFILE%\.claude-switcher\staging`，不会在 `%APPDATA%` 产生额外的 `Claude.new` / `Claude.old`。数据与账号指针先提交，再清理旧目录；清理失败不会把指针留在旧账号。下次切换只重试清理 `cleanup.json` 能证明归属的残留，不明目录仍需人工确认，绝不自动删除。若 `%APPDATA%` 与 `%USERPROFILE%` 在不同卷，为避免跨卷改名失败，仍使用原 `Claude.new` / `Claude.old` 路径。
+
 跨身份保留默认关闭。在 `%USERPROFILE%\.claude-switcher\keep-in-workspace.txt` 中每行写一个相对 `%APPDATA%\Claude` 的路径（如 `settings.json`、`skills/`），切换时先暂存，再合并到目标账号。绝对路径、盘符路径、`..` 越界和重解析点会跳过；暂存或还原失败会阻止启动，已有 `keep-stage` 不会被覆盖。只共享通用配置，不要放登录态、Cookie、缓存或账号专属数据。
 
 ## 维护工具
@@ -173,7 +175,7 @@ claude-switch.ps1 diagnose-proxy --config <私有配置.json>
 
 - **本次新增 UI、FlClash、隔离浏览器、代理诊断、加密快照、安装和更新流程尚未做 Windows 真机验收**。仓库中的 Python/XAML 静态检查不等于 Windows 运行验证。可在 Windows PowerShell 中运行隔离回归：`powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows-switch-integration.ps1` 与 `tests\windows-snapshot-integration.ps1`。
 - Clash Verge 的 TUN 开关在 Windows 上如果被更新重置,目前需要手动在设置里重新打开(一键修复会提示)。
-- 账号快照切换前请确保 Claude 已完全退出(托盘图标也要退出)。若看到 `accounts\<槽位>.new` / `.previous` 或 `Claude.new` / `Claude.old` 残留,说明上次切换被中断,先确认数据再清理。
+- 账号快照切换前请确保 Claude 已完全退出(托盘图标也要退出)。若看到 `accounts\<槽位>.new` / `.previous` 或 `staging\Claude.new` / `Claude.old` 残留,说明上次切换被中断；没有有效 `cleanup.json` 归属证明时，先确认数据再清理，不要直接删除。
 - WebRTC 检查在 STUN 全部无响应时显示 `warn:STUN 无响应,未确认 UDP 出口`——「探测不到」不等于「零暴露」。
 - 旧版切换器可能在 `Merge.yaml` 留下 `prepend-rules` / 多文档 `---`。当前「一键修复」会备份并清理，规则模式改用 `Script.js`；全局/直连模式跳过规则，只在需要清理旧 Merge 时重启一次。规则模式重启后验证内核 `/rules` 前 16 条，失败自动回滚。
 - **`auto` / `other` 的 TUN 判定是通用启发式**:虚拟网卡存在不等于代理隧道已接管，可能误判；请改成实际客户端模式后重跑安装器。

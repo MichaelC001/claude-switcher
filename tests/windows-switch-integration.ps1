@@ -31,6 +31,13 @@ function global:Start-Process {
     param($FilePath, $ArgumentList, [switch]$Wait, [switch]$NoNewWindow)
     return $null
 }
+$script:failOldCleanup = $false
+function global:Remove-Item {
+    [CmdletBinding()]
+    param([string]$LiteralPath, [switch]$Recurse, [switch]$Force, [string]$ErrorAction)
+    if ($script:failOldCleanup -and $LiteralPath -eq "$BASE\staging\Claude.old") { throw 'simulated locked recovery directory' }
+    Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters
+}
 
 $failures = 0
 function Assert([string]$what, [bool]$condition, [string]$detail = '') {
@@ -107,6 +114,29 @@ try {
     Assert 'keep 暂存成功后清理' (-not (Test-Path -LiteralPath "$base\keep-stage"))
     $status = (@(Invoke-Status) -join "`n")
     Assert '状态包含 C/D 与账号列表' ($status -match 'hasC=1 hasD=0' -and $status -match 'accounts=A,B')
+
+    # 8. 清理失败：数据和指针仍提交到目标账号，归属明确的残留下次可清理
+    $script:failOldCleanup = $true
+    $r = Invoke-Switch 'B'
+    Assert '旧目录清理失败仍提交 current=B' ((Read-Text "$base\current.txt") -eq 'B') "输出=$r"
+    Assert '清理失败的旧目录被保留' (Test-Path -LiteralPath "$base\staging\Claude.old")
+    Assert '清理失败有归属标记' (Test-Path -LiteralPath "$base\staging\cleanup.json")
+    Assert '默认暂存不在 APPDATA 产生 Claude.new' (-not (Test-Path -LiteralPath "$data.new"))
+    Assert '默认备份不在 APPDATA 产生 Claude.old' (-not (Test-Path -LiteralPath "$data.old"))
+    $script:failOldCleanup = $false
+    $null = Invoke-Switch 'A'
+    Assert '下次切换先清理已确认归属的旧目录' (-not (Test-Path -LiteralPath "$base\staging\Claude.old"))
+    Assert '归属标记清理后移除' (-not (Test-Path -LiteralPath "$base\staging\cleanup.json"))
+    Assert '恢复后 current=A' ((Read-Text "$base\current.txt") -eq 'A')
+
+    # 9. 没有归属证明的旧目录仍拒绝覆盖且不会自动删除
+    New-Item -ItemType Directory -Path "$base\staging\Claude.old" -Force | Out-Null
+    Set-Content -LiteralPath "$base\staging\Claude.old\only-copy.txt" -Value 'preserve' -Encoding UTF8
+    $r = Invoke-Switch 'B'
+    Assert '不明旧目录仍拒绝切换' (((@($r) -join "`n") -match '(?m)^FAIL:')) "输出=$r"
+    Assert '不明旧目录内容不删除' ((Read-Text "$base\staging\Claude.old\only-copy.txt") -eq 'preserve')
+    Assert '不明残留时 current 不变' ((Read-Text "$base\current.txt") -eq 'A')
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath "$base\staging\Claude.old" -Recurse -Force
 } finally {
     $ErrorActionPreference = $scriptErrorPreference
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
