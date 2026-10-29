@@ -26,6 +26,7 @@ function Get-TunStatus {
 function Test-ClientAlive {
     switch ($PROXY_MODE) {
         'clash-verge' { return [bool](Get-Process -Name 'verge-mihomo' -ErrorAction SilentlyContinue) }
+        'flclash'     { return [bool](Get-Process -Name 'FlClashCore','FlClash' -ErrorAction SilentlyContinue) }
         'sing-box'    { return [bool](Get-Process -Name 'sing-box' -ErrorAction SilentlyContinue) }
         'clashx'      { return [bool](Get-Process -Name 'ClashX' -ErrorAction SilentlyContinue) }
         'surge'       { return [bool](Get-Process -Name 'Surge' -ErrorAction SilentlyContinue) }
@@ -38,6 +39,10 @@ function Test-ClientAlive {
 
 $offline = $false
 while ($true) {
+    if (Test-Path $modeFile) {
+        $currentMode = (Get-Content $modeFile -Raw).Trim()
+        if ($currentMode) { $script:PROXY_MODE = $currentMode }
+    }
     $tun = Get-TunStatus
     $clientUp = Test-ClientAlive
     $alive = $tun.up -and $clientUp

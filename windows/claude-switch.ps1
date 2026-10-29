@@ -231,6 +231,7 @@ function Set-ScriptConfigValue([string]$text, [string]$name, [string]$value) {
 function Get-ProxyName {
     switch ($PROXY_MODE) {
         'clash-verge' { return 'Clash Verge' }
+        'flclash'     { return 'FlClash' }
         'sing-box'    { return 'sing-box' }
         'clashx'      { return 'ClashX' }
         'surge'       { return 'Surge' }
@@ -245,16 +246,59 @@ function Get-ProxyName {
 function Test-ProxyAlive {
     switch ($PROXY_MODE) {
         'clash-verge' { return [bool](Get-Process -Name 'verge-mihomo' -ErrorAction SilentlyContinue) }
+        'flclash'     { return [bool](Get-Process -Name 'FlClashCore','FlClash' -ErrorAction SilentlyContinue) }
         'sing-box'    { return [bool](Get-Process -Name 'sing-box' -ErrorAction SilentlyContinue) }
         'clashx'      { return [bool](Get-Process -Name 'ClashX' -ErrorAction SilentlyContinue) }
         'surge'       { return [bool](Get-Process -Name 'Surge' -ErrorAction SilentlyContinue) }
         'wireguard'   { return [bool](Get-Service -Name 'WireGuardTunnel*' -ErrorAction SilentlyContinue | Where-Object Status -eq 'Running') }
         'other'       { return $true }
         'auto' {
-            if (Get-Process -Name 'verge-mihomo','sing-box','ClashX','Surge' -ErrorAction SilentlyContinue) { return $true }
+            if (Get-Process -Name 'verge-mihomo','FlClashCore','FlClash','sing-box','ClashX','Surge' -ErrorAction SilentlyContinue) { return $true }
             return [bool](Get-Service -Name 'WireGuardTunnel*' -ErrorAction SilentlyContinue | Where-Object Status -eq 'Running')
         }
         default { return [bool](Get-Process -Name 'verge-mihomo' -ErrorAction SilentlyContinue) }
+    }
+}
+
+function Get-Client {
+    "client=$PROXY_MODE"
+    'clients=clash-verge,flclash,sing-box,clashx,surge,wireguard,other,auto'
+}
+
+function Set-ClientMode([string]$Mode) {
+    $allowed = @('clash-verge','flclash','sing-box','clashx','surge','wireguard','other','auto')
+    if ($allowed -notcontains $Mode) {
+        $script:exitCode = 1
+        "FAIL:用法: claude-switch.ps1 set-client <clash-verge|flclash|sing-box|clashx|surge|wireguard|other|auto>"
+        return
+    }
+    $selfPath = $PSCommandPath
+    if (-not $selfPath) { $selfPath = $MyInvocation.MyCommand.Path }
+    if (-not $selfPath -or -not (Test-Path -LiteralPath $selfPath)) {
+        $script:exitCode = 1
+        'FAIL:无法定位当前核心脚本'
+        return
+    }
+    $modePath = Join-Path $BASE 'proxy-mode.txt'
+    $oldText = [System.IO.File]::ReadAllText($selfPath)
+    $oldModeExists = Test-Path -LiteralPath $modePath
+    $oldMode = if ($oldModeExists) { [System.IO.File]::ReadAllText($modePath) } else { '' }
+    try {
+        $newText = Set-ScriptConfigValue $oldText 'PROXY_MODE' $Mode
+        if ($newText -eq $oldText -and $PROXY_MODE -ne $Mode) { throw '核心配置行未更新' }
+        [System.IO.File]::WriteAllText($selfPath, $newText, (New-Object System.Text.UTF8Encoding($true)))
+        [System.IO.File]::WriteAllText($modePath, $Mode, [System.Text.Encoding]::ASCII)
+        $script:PROXY_MODE = $Mode
+        "OK:代理客户端已设为 $Mode"
+        'INFO:保镖会在下一轮巡检读取新模式；非 Clash Verge 客户端请自行配置 Claude 域名规则'
+    } catch {
+        try {
+            [System.IO.File]::WriteAllText($selfPath, $oldText, (New-Object System.Text.UTF8Encoding($true)))
+            if ($oldModeExists) { [System.IO.File]::WriteAllText($modePath, $oldMode, [System.Text.Encoding]::ASCII) }
+            else { Remove-Item -LiteralPath $modePath -Force -ErrorAction SilentlyContinue }
+        } catch {}
+        $script:exitCode = 1
+        "FAIL:代理客户端写入失败，已回滚:$($_.Exception.Message)"
     }
 }
 
@@ -933,6 +977,27 @@ function Get-RulesStatus {
     return '规则置顶=fail:未配置'
 }
 
+function Add-IpHistory([string]$Ip) {
+    if ([string]::IsNullOrWhiteSpace($Ip) -or $Ip -notmatch '^\S+$') { return 0 }
+    $history = Join-Path $BASE 'iphistory.log'
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    [System.IO.File]::AppendAllText($history, "$Ip $now`n", [System.Text.Encoding]::ASCII)
+    $cutoff = $now - 172800
+    $recent = @()
+    $unique = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($line in @([System.IO.File]::ReadAllLines($history))) {
+        if ($line -notmatch '^(\S+) (\d+)$') { continue }
+        $stamp = [long]$Matches[2]
+        if ($stamp -lt $cutoff) { continue }
+        $recent += $line
+        [void]$unique.Add($Matches[1])
+    }
+    $tmp = "$history.tmp"
+    [System.IO.File]::WriteAllLines($tmp, $recent, [System.Text.Encoding]::ASCII)
+    Move-Item -LiteralPath $tmp -Destination $history -Force
+    return $unique.Count
+}
+
 function Invoke-CheckDetail {
     try { $script:CheckConfig = Get-CheckConfig } catch { '检查配置无效，请恢复默认设置'; return }
     $pname = Get-ProxyName
@@ -955,10 +1020,12 @@ function Invoke-CheckDetail {
     } else {
         $lastipFile = "$BASE\lastip.txt"
         $lastip = if (Test-Path $lastipFile) { (Get-Content $lastipFile -Raw).Trim() } else { '' }
+        $ipCount = Add-IpHistory $e.ip
+        $historyWarn = if ($ipCount -ge 3) { "；48h内出口IP变化$ipCount 次，建议固定节点" } else { '' }
         if (-not $e.ip) { Format-OptionalResult 'IP一致' 'fail' '未获取到出口IP' }
-        elseif (-not $lastip) { Format-OptionalResult 'IP一致' 'ok' '首次记录' }
-        elseif ($e.ip -eq $lastip) { Format-OptionalResult 'IP一致' 'ok' }
-        else { Format-OptionalResult 'IP一致' 'warn' "$lastip → $($e.ip)" }
+        elseif (-not $lastip) { Format-OptionalResult 'IP一致' 'ok' "首次记录$historyWarn" }
+        elseif ($e.ip -eq $lastip) { Format-OptionalResult 'IP一致' 'ok' $historyWarn.TrimStart('；') }
+        else { Format-OptionalResult 'IP一致' 'warn' "$lastip → $($e.ip)$historyWarn" }
         if ($e.ip) { $e.ip | Out-File -Encoding ascii -NoNewline $lastipFile }
     }
 
@@ -1020,6 +1087,26 @@ function Invoke-CheckDetail {
         $r2 = & curl.exe -s --max-time 8 -o NUL -w '%{http_code}' "https://api.anthropic.com/v1/models" 2>$null
         if ($r1 -ne '000' -and $r2 -ne '000') { Format-OptionalResult '生态可达性' 'ok' "claude.ai:$r1 api:$r2" } else { Format-OptionalResult '生态可达性' 'fail' "claude.ai:$r1 api:$r2" }
     }
+}
+
+function Invoke-Check {
+    $results = @(Invoke-CheckDetail)
+    $states = @{}
+    $invalid = $false
+    foreach ($line in $results) {
+        if ($line -notmatch '^([^=]+)=(ok|warn|fail|skip)(?::.*)?$') { continue }
+        $name = $Matches[1]; $state = $Matches[2]
+        if ($states.ContainsKey($name)) { $invalid = $true; continue }
+        $states[$name] = $state
+    }
+    $failed = @($states.Keys | Where-Object { $states[$_] -eq 'fail' })
+    if ($invalid -or $states.Count -ne 14 -or $failed.Count -gt 0) {
+        $script:exitCode = 1
+        $detail = if ($failed.Count) { $failed -join '、' } else { '检查输出不完整或重复' }
+        "FAIL:$detail"
+        return
+    }
+    'OK:环境检查通过'
 }
 
 function Invoke-Fix {
@@ -1149,11 +1236,32 @@ function Invoke-Fix {
     "FIX:修复流程结束"
 }
 
+function Format-AccountSize([double]$Bytes) {
+    if ($Bytes -ge 1TB) { return '{0:0.#}T' -f ($Bytes / 1TB) }
+    if ($Bytes -ge 1GB) { return '{0:0.#}G' -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return '{0:0.#}M' -f ($Bytes / 1MB) }
+    if ($Bytes -ge 1KB) { return '{0:0.#}K' -f ($Bytes / 1KB) }
+    return '{0}B' -f [int]$Bytes
+}
+
 function Invoke-Status {
     $cur = if (Test-Path "$BASE\current.txt") { (Get-Content "$BASE\current.txt" -Raw).Trim() } else { 'none' }
-    $hasA = if (Test-Path "$BASE\accounts\A") { 1 } else { 0 }
-    $hasB = if (Test-Path "$BASE\accounts\B") { 1 } else { 0 }
-    "current=$cur hasA=$hasA hasB=$hasB"
+    if ($cur -notmatch '^[A-D]$') { $cur = 'none' }
+    $flags = @(); $archived = @(); $extras = @()
+    foreach ($slot in @('A','B','C','D')) {
+        $dir = Join-Path $BASE "accounts\$slot"
+        $exists = Test-Path -LiteralPath $dir -PathType Container
+        $flags += "has$slot=$(if ($exists) { 1 } else { 0 })"
+        if (-not $exists) { continue }
+        $archived += $slot
+        $measure = Get-ChildItem -LiteralPath $dir -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+        $size = Format-AccountSize ([double]($measure.Sum))
+        $stamp = (Get-Item -LiteralPath $dir).LastWriteTime.ToString('yyyy-MM-dd')
+        $extras += "acc$slot=$size@$stamp"
+    }
+    $accountList = if ($archived.Count) { $archived -join ',' } else { 'none' }
+    $suffix = if ($extras.Count) { ' ' + ($extras -join ' ') } else { '' }
+    "current=$cur $($flags -join ' ') accounts=$accountList$suffix"
 }
 
 $script:SwitchError = ''
@@ -1164,7 +1272,7 @@ function Set-SwitchError([string]$message) {
 }
 
 # robocopy 退出码 0-7 都算成功(1=有文件复制,2=有额外文件,3=两者兼有,4-7 为可恢复异常),8 及以上才是失败
-function Invoke-Robocopy([string]$Source, [string]$Dest, [string]$Mode) {
+function Invoke-Robocopy([string]$Source, [string]$Dest, [string]$Mode, [switch]$ExcludeJunctions) {
     if (-not (Get-Command robocopy -ErrorAction SilentlyContinue)) {
         return [pscustomobject]@{ ok = $false; code = -1 }
     }
@@ -1172,6 +1280,7 @@ function Invoke-Robocopy([string]$Source, [string]$Dest, [string]$Mode) {
         return [pscustomobject]@{ ok = $false; code = 16 }
     }
     $rcArgs = @($Source, $Dest, $Mode, '/NFL', '/NDL', '/NJH', '/NJS', '/R:2', '/W:2')
+    if ($ExcludeJunctions) { $rcArgs += '/XJ' }
     $null = & robocopy @rcArgs 2>&1
     return [pscustomobject]@{ ok = ($LASTEXITCODE -lt 8); code = $LASTEXITCODE }
 }
@@ -1323,16 +1432,111 @@ function Start-ClaudeApp {
     return $false
 }
 
+function Test-KeepPathSafe([string]$RelativePath) {
+    if ([string]::IsNullOrWhiteSpace($RelativePath)) { return $false }
+    $rel = $RelativePath.Trim().Replace('/', '\')
+    while ($rel.EndsWith('\')) { $rel = $rel.Substring(0, $rel.Length - 1) }
+    while ($rel.StartsWith('.\')) { $rel = $rel.Substring(2) }
+    if (-not $rel -or $rel -eq '.' -or [System.IO.Path]::IsPathRooted($rel) -or $rel -match '^[A-Za-z]:') { return $false }
+    $parts = $rel.Split([char]92)
+    if ($parts -contains '..' -or $parts -contains '') { return $false }
+    $prefix = $DATA
+    foreach ($part in $parts) {
+        $prefix = Join-Path $prefix $part
+        if (Test-Path -LiteralPath $prefix) {
+            $item = Get-Item -LiteralPath $prefix -Force -ErrorAction SilentlyContinue
+            if ($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return $false }
+        }
+    }
+    return $true
+}
+
+function Stage-KeepPaths {
+    $script:KeepStaged = 0
+    $keepFile = Join-Path $BASE 'keep-in-workspace.txt'
+    if (-not (Test-Path -LiteralPath $keepFile -PathType Leaf)) { return $true }
+    $stage = Join-Path $BASE 'keep-stage'
+    if (Test-Path -LiteralPath $stage) {
+        return (Set-SwitchError "跨身份保留暂存目录已存在，请检查或重试上次切换:$stage")
+    }
+    $created = $false
+    $count = 0
+    try {
+        foreach ($raw in @([System.IO.File]::ReadAllLines($keepFile))) {
+            $rel = $raw.Trim()
+            if (-not $rel -or $rel.StartsWith('#')) { continue }
+            if (-not (Test-KeepPathSafe $rel)) {
+                Log "WARN:keep 路径必须是相对、无越界且不含重解析点的路径，已跳过:$rel"
+                continue
+            }
+            $normalized = $rel.Trim().Replace('/', '\').TrimEnd('\')
+            while ($normalized.StartsWith('.\')) { $normalized = $normalized.Substring(2) }
+            $source = Join-Path $DATA $normalized
+            if (-not (Test-Path -LiteralPath $source)) { continue }
+            $dest = Join-Path $stage $normalized
+            $parent = Split-Path -Parent $dest
+            New-Item -ItemType Directory -Force -Path $parent -ErrorAction Stop | Out-Null
+            $created = $true
+            $item = Get-Item -LiteralPath $source -Force -ErrorAction Stop
+            if ($item.PSIsContainer) {
+                $rc = Invoke-Robocopy $source $dest '/E' -ExcludeJunctions
+                if (-not $rc.ok) { throw "robocopy $($rc.code)" }
+            } else {
+                Copy-Item -LiteralPath $source -Destination $dest -Force -ErrorAction Stop
+            }
+            $count++
+        }
+    } catch {
+        if ($created) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+        return (Set-SwitchError "跨身份保留暂存失败:$($_.Exception.Message)")
+    }
+    if ($count -eq 0) {
+        if ($created) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+        return $true
+    }
+    $script:KeepStaged = $count
+    Log "跨身份保留:已收起 $count 条路径"
+    return $true
+}
+
+function Restore-KeepPaths {
+    $stage = Join-Path $BASE 'keep-stage'
+    if (-not (Test-Path -LiteralPath $stage -PathType Container)) { return $true }
+    $rc = Invoke-Robocopy $stage $DATA '/E' -ExcludeJunctions
+    if (-not $rc.ok) {
+        return (Set-SwitchError "跨身份保留还原失败，暂存保留在 $stage(robocopy $($rc.code))")
+    }
+    try {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction Stop
+    } catch {
+        return (Set-SwitchError "跨身份保留已合并，但暂存目录清理失败:$($_.Exception.Message)")
+    }
+    Log "跨身份保留:已还原 $($script:KeepStaged) 条路径到新账号"
+    return $true
+}
+
+function Write-SwitchFailure([string]$Message) {
+    $script:exitCode = 1
+    "FAIL:$Message"
+}
+
 function Invoke-Switch($target) {
     $script:SwitchError = ''
-    if (-not (Test-AccountSlot $target)) { "FAIL:账号必须是 A、B、C 或 D"; return }
+    $script:exitCode = 0
+    if (-not (Test-AccountSlot $target)) { $script:exitCode = 1; "FAIL:账号必须是 A、B、C 或 D"; return }
     $cur = if (Test-Path "$BASE\current.txt") { (Get-Content "$BASE\current.txt" -Raw).Trim() } else { 'none' }
     $justArchived = $false
 
     # 首次运行:收编当前登录为账号A
     if ($cur -eq 'none' -and (Test-Path $DATA) -and (Get-ChildItem $DATA -ErrorAction SilentlyContinue)) {
-        if (-not (Stop-ClaudeApp)) { "FAIL:Claude 未能退出，请手动退出后重试"; return }
-        if (-not (Save-Account 'A')) { "FAIL:$($script:SwitchError)"; return }
+        if (-not (Stop-ClaudeApp)) { Write-SwitchFailure 'Claude 未能退出，请手动退出后重试'; return }
+        if ((Test-Path "$BASE\keep-in-workspace.txt") -and -not (Stage-KeepPaths)) {
+            Write-SwitchFailure $script:SwitchError; return
+        }
+        if (-not (Save-Account 'A')) {
+            Remove-Item -LiteralPath "$BASE\keep-stage" -Recurse -Force -ErrorAction SilentlyContinue
+            Write-SwitchFailure $script:SwitchError; return
+        }
         $cur = 'A'; 'A' | Out-File -Encoding ascii -NoNewline "$BASE\current.txt"
         Log "首次运行:当前登录状态已收编为账号A"
         $justArchived = $true
@@ -1340,26 +1544,39 @@ function Invoke-Switch($target) {
     }
 
     if ($cur -eq $target) {
-        if (-not (Test-Path $DATA) -and (Test-Path "$BASE\accounts\$target")) {
-            if (-not (Load-Account $target)) { "FAIL:$($script:SwitchError)"; return }
+        if (-not (Test-Path $DATA)) {
+            if (-not (Test-Path "$BASE\accounts\$target")) { Write-SwitchFailure "账号$target 数据目录缺失，已停止切换"; return }
+            if (-not (Load-Account $target)) { Write-SwitchFailure $script:SwitchError; return }
+        }
+        if ((Test-Path "$BASE\keep-stage") -and -not (Restore-KeepPaths)) {
+            Write-SwitchFailure $script:SwitchError; return
         }
         if (-not (Start-ClaudeApp)) { "WARN:未找到 Claude 可执行文件，请手动启动" }
         "INFO:当前已是账号$target"
         return
     }
 
-    if (-not (Stop-ClaudeApp)) { "FAIL:Claude 未能退出，请手动退出后重试"; return }
+    if (-not (Stop-ClaudeApp)) { Write-SwitchFailure 'Claude 未能退出，请手动退出后重试'; return }
 
     if (-not $justArchived -and $cur -ne 'none' -and (Test-Path $DATA)) {
-        if (-not (Save-Account $cur)) { "FAIL:$($script:SwitchError)"; return }
+        if ((Test-Path "$BASE\keep-in-workspace.txt") -and -not (Stage-KeepPaths)) {
+            Write-SwitchFailure $script:SwitchError; return
+        }
+        if (-not (Save-Account $cur)) {
+            Remove-Item -LiteralPath "$BASE\keep-stage" -Recurse -Force -ErrorAction SilentlyContinue
+            Write-SwitchFailure $script:SwitchError; return
+        }
     }
 
     if (Test-Path "$BASE\accounts\$target") {
-        if (-not (Load-Account $target)) { "FAIL:$($script:SwitchError)"; return }
+        if (-not (Load-Account $target)) { Write-SwitchFailure $script:SwitchError; return }
     } else {
-        if (-not (New-AccountData $target)) { "FAIL:$($script:SwitchError)"; return }
+        if (-not (New-AccountData $target)) { Write-SwitchFailure $script:SwitchError; return }
     }
     $target | Out-File -Encoding ascii -NoNewline "$BASE\current.txt"
+    if ((Test-Path "$BASE\keep-stage") -and -not (Restore-KeepPaths)) {
+        Write-SwitchFailure $script:SwitchError; return
+    }
     if (-not (Start-ClaudeApp)) { "WARN:已切换但未找到 Claude 可执行文件，请手动启动" }
     Log "已切换到账号$target 并启动"
     "OK:已切换到账号$target"
@@ -1586,6 +1803,7 @@ try {
             }) -join ' ')
             $r
         }
+        'check'        { Invoke-Check }
         'status'       { Invoke-Status }
         'fix' {
             $r = @(Invoke-Fix)
@@ -1594,6 +1812,8 @@ try {
         }
         'switch'       { Invoke-Switch $args[1] }
         'set-region'   { Invoke-SetRegion }
+        'set-client'   { Set-ClientMode $args[1] }
+        'get-client'   { Get-Client }
         'check-update' { Invoke-CheckUpdate }
         'update-now'   { Invoke-UpdateNow }
         'rules-status' { Invoke-RulesStatus }

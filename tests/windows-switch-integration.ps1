@@ -94,6 +94,19 @@ try {
     foreach ($leftover in @("$accounts\A.new", "$accounts\A.previous", "$accounts\B.new", "$accounts\B.previous", "$data.new", "$data.old")) {
         Assert "无残留 $leftover" (-not (Test-Path -LiteralPath $leftover))
     }
+
+    # 7. C 槽位与跨身份保留：只合并显式列出的路径
+    Set-Content -LiteralPath (Join-Path $data 'settings.json') -Value 'shared-A' -Encoding UTF8 -NoNewline
+    Set-Content -LiteralPath (Join-Path $data 'private.txt') -Value 'account-A-only' -Encoding UTF8 -NoNewline
+    Set-Content -LiteralPath (Join-Path $base 'keep-in-workspace.txt') -Value 'settings.json' -Encoding UTF8
+    $null = Invoke-Switch 'C'
+    Assert 'C 槽位切换后 current=C' ((Read-Text "$base\current.txt") -eq 'C')
+    Assert 'keep 路径进入新账号' ((Read-Text "$data\settings.json") -eq 'shared-A')
+    Assert '未列出的账号文件不进入新账号' (-not (Test-Path -LiteralPath "$data\private.txt"))
+    Assert 'keep 路径仍归档在原账号' ((Read-Text "$accounts\A\settings.json") -eq 'shared-A')
+    Assert 'keep 暂存成功后清理' (-not (Test-Path -LiteralPath "$base\keep-stage"))
+    $status = (@(Invoke-Status) -join "`n")
+    Assert '状态包含 C/D 与账号列表' ($status -match 'hasC=1 hasD=0' -and $status -match 'accounts=A,B')
 } finally {
     $ErrorActionPreference = $scriptErrorPreference
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue

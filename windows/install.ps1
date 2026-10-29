@@ -16,6 +16,8 @@ Write-Host ""
 $PROXY_MODE = $null
 if ($CLASH_DIR) {
     $PROXY_MODE = 'clash-verge'
+} elseif (Get-Process -Name 'FlClashCore','FlClash' -ErrorAction SilentlyContinue) {
+    $PROXY_MODE = 'flclash'
 } elseif (Get-Process -Name 'sing-box' -ErrorAction SilentlyContinue) {
     $PROXY_MODE = 'sing-box'
 } elseif (Get-Process -Name 'ClashX' -ErrorAction SilentlyContinue) {
@@ -27,18 +29,20 @@ if ($CLASH_DIR) {
 }
 if (-not $PROXY_MODE) {
     Write-Host "未自动识别到代理客户端,请选择:" -ForegroundColor Yellow
-    Write-Host "  1) clash-verge  2) sing-box  3) clashx  4) surge"
-    Write-Host "  5) wireguard    6) other(仅TUN)  7) auto(任一命中即活)"
+    Write-Host "  1) clash-verge  2) flclash     3) sing-box  4) clashx"
+    Write-Host "  5) surge        6) wireguard   7) other     8) auto"
     $pick = Read-Host "请输入序号或名称(直接回车=auto)"
     switch ($pick) {
         '1' { $PROXY_MODE = 'clash-verge' }
-        '2' { $PROXY_MODE = 'sing-box' }
-        '3' { $PROXY_MODE = 'clashx' }
-        '4' { $PROXY_MODE = 'surge' }
-        '5' { $PROXY_MODE = 'wireguard' }
-        '6' { $PROXY_MODE = 'other' }
-        '7' { $PROXY_MODE = 'auto' }
+        '2' { $PROXY_MODE = 'flclash' }
+        '3' { $PROXY_MODE = 'sing-box' }
+        '4' { $PROXY_MODE = 'clashx' }
+        '5' { $PROXY_MODE = 'surge' }
+        '6' { $PROXY_MODE = 'wireguard' }
+        '7' { $PROXY_MODE = 'other' }
+        '8' { $PROXY_MODE = 'auto' }
         'clash-verge' { $PROXY_MODE = 'clash-verge' }
+        'flclash'     { $PROXY_MODE = 'flclash' }
         'sing-box'    { $PROXY_MODE = 'sing-box' }
         'clashx'      { $PROXY_MODE = 'clashx' }
         'surge'       { $PROXY_MODE = 'surge' }
