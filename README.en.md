@@ -38,7 +38,7 @@ closing the window in which traffic could leave outside the proxy.
 - **Diagnostics** — a standalone proxy check reports transport results for the Claude web and API endpoints without reading account data.
 - **Native menu bar UI** — a single-file SwiftUI app with no Xcode project and no third-party dependencies.
 - **Web check page** — a static browser-side check for exit IP, time zone, language, WebRTC, IPv6, and common fingerprint signals.
-- **Windows and Linux ports (beta)** — PowerShell and bash implementations with the same audit and switching model.
+- **Windows and Linux ports (beta)** — PowerShell and bash implementations with the same audit and switching model. Windows also includes A–D accounts, proxy-client switching, read-only inspection tools, isolated browsing, standalone proxy diagnostics, and encrypted `.csnap` snapshots (not compatible with macOS DMG). New Windows UI and runtime flows still require hardware verification; static checks are not a substitute.
 
 ## Install
 

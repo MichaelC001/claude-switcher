@@ -211,6 +211,14 @@ skills/
 
 **风险提示**：跨身份保留意味着这些文件会成为多个账号之间的共同特征。不要放登录凭证、Cookie、设备标识、缓存或任何账号专属数据；只共享自己确认无关联风险的内容。默认关闭是有意为之。
 
+## Windows 功能对齐（Beta）
+
+Windows PowerShell/WPF 版已提供 A–D 四账号、48 小时出口审查、跨身份保留、应用内代理客户端切换（含 FlClash）、设备指纹与 Claude Code CLI 体检、一次性隔离浏览器、独立代理诊断及加密快照迁移。主窗口会重新检查后才允许切换，检查/修复/切换等长任务在后台执行，设置、诊断导出与 Release 一键更新保留 Windows 自有实现。
+
+Windows 加密快照使用 `.csnap`（PBKDF2-HMAC-SHA256 + AES-256-CBC + HMAC-SHA256），与 macOS 加密 DMG **不兼容**。命令为 `claude-switch.ps1 snapshot-export A <文件.csnap>` / `snapshot-import <文件.csnap> A`。独立代理诊断使用 `diagnose-proxy --proxy <URL>` 或 `--config <文件>`，不读取账号状态、不修改系统、不记录客户端日志。
+
+完整命令、平台差异、隔离测试与未验证范围见 [windows/README.md](windows/README.md)。**Windows 新界面和上述新增流程尚未完成真机验收，静态测试不代表 Windows 真机通过。**
+
 ## Web 版环境检测（零安装）
 
 手机 / 平板浏览器打开即测，无需安装：[https://yoursjeyo.github.io/claude-switcher/](https://yoursjeyo.github.io/claude-switcher/)
@@ -419,7 +427,7 @@ Bug 反馈和功能建议仍建议提交 Issue，便于跟踪与处理。
 - [x] macOS 版：14 项环境审计 + Kill-Switch + 快照切换 + 漂移自愈（已稳定）
 - [x] Windows 版（Beta）：核心逻辑全移植
 - [x] Linux 版（Beta）：bash 核心 + systemd 保镖 + 终端菜单
-- [ ] Windows 版稳定化：多客户端/地区自适应/TUN 通用判定已落地（静态验证通过），真机回归持续进行
+- [ ] Windows 版稳定化：A–D、诊断工具、加密快照与 WPF 功能对齐已落地（静态验证通过），真机回归持续进行
 - [ ] Linux 版稳定化：多客户端/地区自适应/COW 快照已落地（桩测试通过），多发行版真机回归持续进行
 - [x] Web 版环境检测页：手机/平板浏览器打开即测，零安装
 - [x] 更多指纹维度：桌面端 `fingerprint` 命令覆盖字体地区特征 + GPU/虚拟机特征，Canvas/WebGL 由 Web 检测页覆盖

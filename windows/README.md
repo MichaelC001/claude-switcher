@@ -8,6 +8,7 @@
 - PowerShell 5.1+（Windows 自带,无需安装）
 - 代理客户端（需支持 TUN 模式），安装器会自动探测并写入 `$PROXY_MODE`:
   - **Clash Verge** —— 存在配置目录即识别，可由「一键修复」按当前模式配置置顶规则
+  - **FlClash** —— 识别 `FlClashCore` / `FlClash` 进程
   - **sing-box / ClashX / Surge / WireGuard** —— 按进程或服务识别
   - **其他 TUN 客户端**（Astrill / OpenVPN / Tailscale 等）—— 安装时选 `other`
   - **auto** —— 任一已知进程/服务命中即视为在线（未识别到客户端时的默认选项）
@@ -44,6 +45,7 @@ Windows 版启动时会静默检查 GitHub 最新 Release，有新版本时在�
 | 客户端 | `$PROXY_MODE` | 存活判定 | 说明 |
 |---|---|---|---|
 | Clash Verge | `clash-verge` | `verge-mihomo` 进程 + TUN | 按 Clash 模式自动配置规则（全局/直连跳过） |
+| FlClash | `flclash` | `FlClashCore` / `FlClash` 进程 + TUN | 置顶规则需自行配置 |
 | sing-box | `sing-box` | `sing-box` 进程 + TUN | 置顶规则需自行配置 |
 | ClashX | `clashx` | `ClashX` 进程 + TUN | 置顶规则需自行配置 |
 | Surge | `surge` | `Surge` 进程 + TUN | 置顶规则需自行配置 |
@@ -52,6 +54,8 @@ Windows 版启动时会静默检查 GitHub 最新 Release，有新版本时在�
 | 自动 | `auto` | 任一已知进程/服务 + TUN | 保镖在 `auto` 下同样只查 TUN |
 
 TUN 判定顺序：先看是否存在 `198.18.x.x` 假 IP（Clash 系 fake-ip）；没有则回退到任意处于 `Up` 状态、描述匹配 `TAP/TUN/WireGuard/Wintun/VPN/Tailscale` 的虚拟网卡。198.18 命中时保持原来的 `TUN网卡=ok`；回退命中时显示 `TUN网卡=ok:通用虚拟网卡`。
+
+可在主窗口「代理客户端」下拉框切换，或运行 `claude-switch.ps1 set-client <模式>` / `get-client`。该操作会同时更新核心脚本和 `proxy-mode.txt`，保镖下一轮巡检即使用新模式；切换后自动重新执行完整审计。
 
 ## Clash 规则与全局模式
 
@@ -114,9 +118,46 @@ claude-switch.ps1 set-check-config '{"disabled":["DNS"],"allowOptionalFailures":
 
 脱敏客户端日志默认开启，位于 `%USERPROFILE%\.claude-switcher\logs\client.log`，达到 512 KiB 后轮转为 `client.log.1`。日志只记录命令、退出码、耗时和检查状态，不记录公网/住宅/代理 IP、Bearer/token/session/cookie、账号内容或 Clash 配置。点击主窗口「导出诊断」可生成 zip；也可以运行 `claude-switch.ps1 export-diagnostics <文件路径>`。诊断包只含客户端日志、检查设置和脱敏环境/状态摘要，不包含账号快照、`lastip`、`iphistory` 或原始 `last-check.txt`。
 
+## 四账号与跨身份保留
+
+主窗口支持 A–D 四个账号卡片，显示当前账号、已建档状态、快照大小和归档日期。每次切换前会重新完成 14 项审计；输出不完整、硬性项失败或另一操作仍在进行时不会切换。`status` 与 `switch A|B|C|D` 也可在命令行使用，`check` 提供静默总检。启用 `IP一致` 时会维护最近 48 小时出口历史，不同出口达到 3 个会给出警告；禁用该项后不记录这段历史。
+
+跨身份保留默认关闭。在 `%USERPROFILE%\.claude-switcher\keep-in-workspace.txt` 中每行写一个相对 `%APPDATA%\Claude` 的路径（如 `settings.json`、`skills/`），切换时先暂存，再合并到目标账号。绝对路径、盘符路径、`..` 越界和重解析点会跳过；暂存或还原失败会阻止启动，已有 `keep-stage` 不会被覆盖。只共享通用配置，不要放登录态、Cookie、缓存或账号专属数据。
+
+## 维护工具
+
+主窗口「工具」提供以下入口，长任务在后台执行：
+
+- `fingerprint`：只读检查地区特征字体、GPU、分辨率和常见虚拟化特征；Canvas/WebGL 仍使用 Web 检测页。
+- `cli-info`：只读检查 Claude Code CLI 路径、版本、安装方式、桌面版内置 CLI 和配置目录，不执行升级或卸载。
+- `open-safe <http(s)://链接>`：使用 Chrome / Chromium / Edge / Brave 的独立临时 profile，禁用扩展和非代理 UDP；窗口关闭后由独立清理进程删除 profile。代理/TUN 未就绪时拒绝打开。
+- `set-region`：换国家节点后重新适配出口地区，可能弹出一次 UAC。
+
+## 加密快照导出与导入
+
+「工具 → 导出/导入加密快照」支持 A–D，也可使用：
+
+```powershell
+claude-switch.ps1 snapshot-export A <文件.csnap>
+claude-switch.ps1 snapshot-import <文件.csnap> A
+```
+
+Windows 使用 `.csnap` 格式：PBKDF2-HMAC-SHA256（200,000 轮）派生密钥，AES-256-CBC 加密，HMAC-SHA256 认证，认证通过后才解压。密码至少 8 位，只经标准输入传递；文件采用流式处理，不会把整份快照读入内存。当前账号不能导出，已有目标槽位、错误密码、文件篡改、账号不匹配、越界路径和链接均会拒绝，失败不会覆盖既有快照。
+
+**`.csnap` 与 macOS 的 AES-256 DMG 不兼容**，不能直接跨系统导入。忘记密码无法找回；导入的是本地登录态，服务端会话失效后仍需重新登录。
+
+## 独立代理诊断
+
+```powershell
+claude-switch.ps1 diagnose-proxy --proxy http://127.0.0.1:18080
+claude-switch.ps1 diagnose-proxy --config <私有配置.json>
+```
+
+也可设置 `CLAUDE_SWITCHER_PROXY_URL`。支持 `http`、`https`、`socks5`、`socks5h`，必须显式包含端口；配置文件只需 `{"proxy_url":"http://127.0.0.1:18080"}`。命令只向 Claude 网页/API 发送无认证请求，输出与 macOS 相同语义的 JSON：退出码 0 表示传输到达，1 表示传输失败，2 表示配置错误。不会继承系统代理、回退直连、创建账号状态、写客户端日志、启动应用或修改系统设置；代理地址和凭据不进入报告，凭据只经 curl 标准输入传递。401/403 不代表账号可用或启动许可。
+
 ## 与 macOS 版的差异（注意事项）
 
-> macOS 版支持 Clash Verge / Shadowrocket / sing-box / ClashX / Surge 与地区自适应（按出口国家自动锁定时区+地区格式，换节点后 `set-region` 一键重配）。Windows 版已对齐多客户端检测与地区自适应，但 **Shadowrocket 仅 macOS 可用**；Windows 的时区映射覆盖美国主要时区、加拿大多伦多/温哥华、日本、韩国、新加坡、台湾、香港、英国、德国、法国、澳大利亚（悉尼/墨尔本）和马来西亚（吉隆坡），其他时区会回退到 `Eastern Standard Time`。地区格式由 `$LOCALE_TARGET` 控制，`set-region` 可重新探测出口并更新国家/时区/地区格式。macOS 的 `update` 命令与 12 小时自动检查、48 小时 IP 审查未移植到 Windows；Windows 另有一套启动检查 + 一键更新，见上文「更新」。
+> Windows 已对齐 A–D、48 小时出口审查、跨身份保留、指纹/CLI 体检、隔离浏览器、独立代理诊断和加密快照能力。**Shadowrocket 仅 macOS 可用**；Windows 额外支持 WireGuard 与其他 TUN 客户端。Windows 时区映射覆盖美国主要时区、加拿大多伦多/温哥华、日本、韩国、新加坡、台湾、香港、英国、德国、法国、澳大利亚（悉尼/墨尔本）和马来西亚（吉隆坡），其他时区回退到 `Eastern Standard Time`。macOS 使用 launchd 与 `update`，Windows 保留 Release 启动检查 + 一键更新机制。macOS 快照为 DMG，Windows 为上述 `.csnap`。
 
 | 项目 | 说明 |
 |---|---|
@@ -128,16 +169,13 @@ claude-switch.ps1 set-check-config '{"disabled":["DNS"],"allowOptionalFailures":
 | 账号数据目录 | Windows 版在 `%APPDATA%\Claude`(与 macOS 路径不同,逻辑相同) |
 | 卸载 | 计划任务里删掉 ClaudeBodyguard,删除 `%USERPROFILE%\.claude-switcher` 和桌面快捷方式即可 |
 
-## 已知限制
+## 已知限制与验证范围
 
-- 设备指纹体检（`fingerprint`）与 Web 检测页为 macOS/浏览器能力，Windows 版暂未内置，可用 Web 版检查 Canvas/WebGL。
-- 界面是 WPF 重写的第一版,样式以 Mac 版为准对齐,细节可能有出入
-- Clash Verge 的 TUN 开关在 Windows 上如果被更新重置,目前需要手动在设置里重新打开(一键修复会提示)
-- 账号快照切换前请确保 Claude 已完全退出(托盘图标也要退出)
-- 切换账号改为「先复制到暂存目录、校验成功后再整体换位」:中途失败或取消不会删除当前数据。若看到 `accounts\<槽位>.new` / `.previous` 或 `Claude.new` / `Claude.old` 残留,说明上次切换被中断,先确认数据再清理
-- WebRTC 检查在 STUN 全部无响应时显示 `warn:STUN 无响应,未确认 UDP 出口`(与 macOS 版一致)——「探测不到」不等于「零暴露」
-- 旧版切换器可能在 `Merge.yaml` 留下 `prepend-rules` / 多文档 `---`，导致 Clash 报 `Merge.yaml ... containing more than one document` 或 TUN 异常。当前「一键修复」会自动备份并清理这些遗留内容，规则模式改用 `Script.js`，不再写 `Merge.yaml`；全局/直连模式跳过规则，只在需要清理旧 Merge 时重启一次
-- 「一键修复」在规则模式写入/清理后会重启 Clash Verge（任务栏/托盘图标会短暂消失，属正常）；全局模式仅在清理历史 Merge 时重启。规则模式重启后会验证内核 `/rules` 前 16 条，失败自动回滚 `Script.js`；控制接口不可用时只提示“无法验证”，不会谎报成功
-- **`auto` / `other` 的 TUN 判定是通用启发式**:只要有一块处于 `Up` 状态、描述里带 `TAP/TUN/WireGuard/Wintun/VPN/Tailscale` 的网卡就会判定 TUN 在线,无法区分"代理隧道已接管"还是"某块虚拟网卡只是存在"。可能误判(例如虚拟网卡残留、其他 VPN 适配器),此时请把 `$PROXY_MODE` 改成实际客户端后重跑安装器;若仍不稳定,可在计划任务中暂停 `ClaudeBodyguard`
-- **非 Clash 客户端**:保镖已按客户端模式分派,不再因缺少 `verge-mihomo` 每 10 秒误杀 Claude;但 `规则置顶` 检查只在 Clash Verge 下按模式判定（全局/直连 ok、规则模式验证 `Script.js` 与内核），非 Clash 用户需要自行在客户端里为 `claude.ai` / `anthropic.com` 等域名配置置顶/直连规则。`DNS` 检查也按 `198.18.x.x` 判断,使用非 fake-ip TUN 时可能显示 `fail`,不代表代理不可用
-- 系统区域为 zh-CN(控制台代码页 936/GBK)时,界面通过读取核心脚本落盘的 `last-check.txt`(UTF-8)展示检查结果,不受代码页影响;若你看到"检测输出不完整(3/14)"且用的是旧版界面,请更新到最新版
+- **本次新增 UI、FlClash、隔离浏览器、代理诊断、加密快照、安装和更新流程尚未做 Windows 真机验收**。仓库中的 Python/XAML 静态检查不等于 Windows 运行验证。可在 Windows PowerShell 中运行隔离回归：`powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows-switch-integration.ps1` 与 `tests\windows-snapshot-integration.ps1`。
+- Clash Verge 的 TUN 开关在 Windows 上如果被更新重置,目前需要手动在设置里重新打开(一键修复会提示)。
+- 账号快照切换前请确保 Claude 已完全退出(托盘图标也要退出)。若看到 `accounts\<槽位>.new` / `.previous` 或 `Claude.new` / `Claude.old` 残留,说明上次切换被中断,先确认数据再清理。
+- WebRTC 检查在 STUN 全部无响应时显示 `warn:STUN 无响应,未确认 UDP 出口`——「探测不到」不等于「零暴露」。
+- 旧版切换器可能在 `Merge.yaml` 留下 `prepend-rules` / 多文档 `---`。当前「一键修复」会备份并清理，规则模式改用 `Script.js`；全局/直连模式跳过规则，只在需要清理旧 Merge 时重启一次。规则模式重启后验证内核 `/rules` 前 16 条，失败自动回滚。
+- **`auto` / `other` 的 TUN 判定是通用启发式**:虚拟网卡存在不等于代理隧道已接管，可能误判；请改成实际客户端模式后重跑安装器。
+- **非 Clash 客户端**:规则置顶需要自行配置。`DNS` 检查按 `198.18.x.x` 判断,使用非 fake-ip TUN 时可能显示 `fail`,不代表代理不可用。
+- 系统区域为 zh-CN 时，界面通过 UTF-8 文件或 UTF-8 子进程管道读取检查与修复输出，不依赖控制台代码页。
