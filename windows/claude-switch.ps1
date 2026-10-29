@@ -393,7 +393,8 @@ function Test-WebRTC($exitIp) {
         $r = Get-StunPublicIP $s[0] $s[1]
         if ($r -and ($found -notcontains $r)) { $found += $r }
     }
-    if ($found.Count -eq 0) { return @{ code = 'ok'; detail = 'UDP不出网,零暴露' } }
+    # STUN 无响应不等于没有泄漏:可能只是节点不支持 UDP,或规则拦了探测目标却漏了别的 UDP 出口
+    if ($found.Count -eq 0) { return @{ code = 'warn'; detail = 'STUN 无响应,未确认 UDP 出口(不等于零暴露)' } }
     $leak = $found | Where-Object { $_ -ne $exitIp }
     if ($leak) { return @{ code = 'fail'; detail = "暴露非代理IP: $($leak -join ',')" } }
     return @{ code = 'ok'; detail = '仅暴露代理IP' }
@@ -845,8 +846,14 @@ function Invoke-CheckDetail {
 
     Get-RulesStatus
 
-    # 客户端语言: Windows 端 Claude 跟随系统区域格式,地区检查已覆盖
-    "客户端语言=ok:跟随系统"
+    # 客户端语言:Windows 版读不到 Claude 内部语言设置,只能比对系统 UI 语言;不一致时告警，不再无条件报 ok
+    $uiLang = [string]([System.Globalization.CultureInfo]::CurrentUICulture.Name)
+    $wantLang = ([string]$LOCALE_TARGET -split '-')[0].ToLowerInvariant()
+    if ($uiLang -and (($uiLang -split '-')[0].ToLowerInvariant()) -eq $wantLang) {
+        "客户端语言=ok:系统UI=$uiLang"
+    } else {
+        "客户端语言=warn:系统UI=$(if ($uiLang) { $uiLang } else { '未知' }),期望 $wantLang 前缀;Windows 版不读取客户端内部设置"
+    }
 
     $org = ''
     try { $org = ((& curl.exe -s --max-time 6 "https://ipinfo.io/json" 2>$null) | ConvertFrom-Json).org } catch {}
@@ -993,53 +1000,201 @@ function Invoke-Status {
     "current=$cur hasA=$hasA hasB=$hasB"
 }
 
-function Stop-ClaudeApp {
-    $p = Get-Process -Name 'Claude' -ErrorAction SilentlyContinue
-    if (-not $p) { return $true }
-    $p | Stop-Process -Force
-    for ($i = 0; $i -lt 15; $i++) { if (-not (Get-Process -Name 'Claude' -ErrorAction SilentlyContinue)) { return $true }; Start-Sleep 1 }
+$script:SwitchError = ''
+
+function Set-SwitchError([string]$message) {
+    $script:SwitchError = $message
     return $false
 }
 
-function Save-Account($name) {
-    robocopy "$DATA" "$BASE\accounts\$name" /MIR /NFL /NDL /NJH /NJS | Out-Null
+# robocopy 退出码 0-7 都算成功(1=有文件复制,2=有额外文件,3=两者兼有,4-7 为可恢复异常),8 及以上才是失败
+function Invoke-Robocopy([string]$Source, [string]$Dest, [string]$Mode) {
+    if (-not (Get-Command robocopy -ErrorAction SilentlyContinue)) {
+        return [pscustomobject]@{ ok = $false; code = -1 }
+    }
+    if (-not (Test-Path -LiteralPath $Source)) {
+        return [pscustomobject]@{ ok = $false; code = 16 }
+    }
+    $rcArgs = @($Source, $Dest, $Mode, '/NFL', '/NDL', '/NJH', '/NJS', '/R:2', '/W:2')
+    $null = & robocopy @rcArgs 2>&1
+    return [pscustomobject]@{ ok = ($LASTEXITCODE -lt 8); code = $LASTEXITCODE }
+}
+
+# 正常关闭优先:先请求主窗口关闭让 Electron 落盘,10 秒不退再强制结束;强杀期间立刻拷贝数据目录会产生半写文件
+function Stop-ClaudeApp {
+    $p = Get-Process -Name 'Claude' -ErrorAction SilentlyContinue
+    if (-not $p) { return $true }
+    foreach ($proc in $p) {
+        try { $null = $proc.CloseMainWindow() } catch {}
+    }
+    for ($i = 0; $i -lt 10; $i++) {
+        if (-not (Get-Process -Name 'Claude' -ErrorAction SilentlyContinue)) { return $true }
+        Start-Sleep 1
+    }
+    Get-Process -Name 'Claude' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt 15; $i++) {
+        if (-not (Get-Process -Name 'Claude' -ErrorAction SilentlyContinue)) { return $true }
+        Start-Sleep 1
+    }
+    return $false
+}
+
+# 数据目录换位:新目录先备好,再用两次 rename 提交;失败回滚，任何时候都不先删当前数据
+function Switch-DataDir([string]$Stage) {
+    $old = "$DATA.old"
+    if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $DATA) {
+        try { Move-Item -LiteralPath $DATA -Destination $old -ErrorAction Stop }
+        catch { return (Set-SwitchError "当前数据目录无法移开:$($_.Exception.Message)") }
+    }
+    try { Move-Item -LiteralPath $Stage -Destination $DATA -ErrorAction Stop }
+    catch {
+        if (Test-Path -LiteralPath $old) { Move-Item -LiteralPath $old -Destination $DATA -ErrorAction SilentlyContinue }
+        return (Set-SwitchError "新数据目录提交失败，已回滚:$($_.Exception.Message)")
+    }
+    if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }
+    return $true
+}
+
+# 归档当前数据:复制到 <槽位>.new，复制成功后才改名为正式快照;旧快照暂存 .previous，提交后删除
+function Save-Account([string]$name) {
+    $stage = "$BASE\accounts\$name.new"
+    $currentDir = "$BASE\accounts\$name"
+    $previous = "$BASE\accounts\$name.previous"
+    foreach ($p in @($stage, $previous)) {
+        if (Test-Path -LiteralPath $p) {
+            Log "FAIL:账号$name 存在待恢复快照，拒绝覆盖($p)"
+            return (Set-SwitchError "账号$name 存在待恢复快照，拒绝覆盖:$p(确认无价值后手动删除再试)")
+        }
+    }
+    $rc = Invoke-Robocopy $DATA $stage '/MIR'
+    if (-not $rc.ok) {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        Log "FAIL:账号$name 归档复制失败(robocopy $($rc.code))，当前数据未改动"
+        return (Set-SwitchError "账号$name 归档复制失败(robocopy $($rc.code))，当前数据未改动")
+    }
+    if (Test-Path -LiteralPath $currentDir) {
+        try { Move-Item -LiteralPath $currentDir -Destination $previous -ErrorAction Stop }
+        catch {
+            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+            Log "FAIL:账号$name 旧快照无法安全转存"
+            return (Set-SwitchError "账号$name 旧快照无法安全转存，已停止切换")
+        }
+    }
+    try { Move-Item -LiteralPath $stage -Destination $currentDir -ErrorAction Stop }
+    catch {
+        if (Test-Path -LiteralPath $previous) { Move-Item -LiteralPath $previous -Destination $currentDir -ErrorAction SilentlyContinue }
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        Log "FAIL:账号$name 归档提交失败，已回滚旧快照"
+        return (Set-SwitchError "账号$name 归档提交失败，已回滚旧快照")
+    }
+    if (Test-Path -LiteralPath $previous) { Remove-Item -LiteralPath $previous -Recurse -Force -ErrorAction SilentlyContinue }
     Log "已存档账号$name"
+    return $true
+}
+
+# 载入快照:先复制到 Claude.new，再整体换位;提交前当前数据始终保留
+function Load-Account([string]$name) {
+    $source = "$BASE\accounts\$name"
+    $stage = "$DATA.new"
+    if (-not (Test-Path -LiteralPath $source)) { return (Set-SwitchError "账号$name 没有可用快照") }
+    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    $rc = Invoke-Robocopy $source $stage '/E'
+    if (-not $rc.ok) {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        Log "FAIL:账号$name 存档载入失败(robocopy $($rc.code))"
+        return (Set-SwitchError "账号$name 存档载入失败(robocopy $($rc.code))，当前数据未改动")
+    }
+    if (-not (Switch-DataDir $stage)) {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    Log "已载入账号$name 存档"
+    return $true
+}
+
+# 空槽位:用空目录换位，不先删当前数据
+function New-AccountData([string]$name) {
+    $stage = "$DATA.new"
+    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not (New-Item -ItemType Directory -Force -Path $stage -ErrorAction SilentlyContinue)) {
+        return (Set-SwitchError "无法创建账号$name 数据目录")
+    }
+    if (-not (Switch-DataDir $stage)) { return $false }
+    Log "账号$name 无存档，已初始化为全新状态"
+    return $true
+}
+
+function Test-AccountSlot([string]$slot) { return ([string]$slot -match '^[A-D]$') }
+
+# Store 安装的 Claude 没有常见 exe 路径，按 Appx 包清单拼 AUMID 启动
+function Find-ClaudeAumid {
+    # Get-AppxPackage 在受限账户/策略禁用环境下会直接终止脚本，这里整体兜住
+    try {
+        $pkg = Get-AppxPackage -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like '*Claude*' -or $_.PackageFamilyName -like '*Claude*' } |
+            Select-Object -First 1
+        if (-not $pkg) { return '' }
+        $manifest = Get-AppxPackageManifest -Package $pkg.PackageFullName -ErrorAction Stop
+        $appId = [string](@($manifest.Package.Applications.Application)[0].Id)
+        if (-not $appId) { return '' }
+        return "shell:AppsFolder\$($pkg.PackageFamilyName)!$appId"
+    } catch {
+        return ''
+    }
 }
 
 function Start-ClaudeApp {
-    $exe = @("$env:LOCALAPPDATA\AnthropicClaude\Claude.exe", "$env:LOCALAPPDATA\Programs\Claude\Claude.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if ($exe) { Start-Process $exe } else { Start-Process "shell:AppsFolder" -ErrorAction SilentlyContinue }
+    $exe = @("$env:LOCALAPPDATA\AnthropicClaude\Claude.exe", "$env:LOCALAPPDATA\Programs\Claude\Claude.exe") |
+        Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($exe) {
+        try { Start-Process $exe -ErrorAction Stop; return $true } catch {}
+    }
+    $aumid = Find-ClaudeAumid
+    if ($aumid) {
+        try { Start-Process $aumid -ErrorAction Stop; return $true } catch {}
+    }
+    return $false
 }
 
 function Invoke-Switch($target) {
+    $script:SwitchError = ''
+    if (-not (Test-AccountSlot $target)) { "FAIL:账号必须是 A、B、C 或 D"; return }
     $cur = if (Test-Path "$BASE\current.txt") { (Get-Content "$BASE\current.txt" -Raw).Trim() } else { 'none' }
+    $justArchived = $false
 
     # 首次运行:收编当前登录为账号A
     if ($cur -eq 'none' -and (Test-Path $DATA) -and (Get-ChildItem $DATA -ErrorAction SilentlyContinue)) {
         if (-not (Stop-ClaudeApp)) { "FAIL:Claude 未能退出，请手动退出后重试"; return }
-        Save-Account A
+        if (-not (Save-Account 'A')) { "FAIL:$($script:SwitchError)"; return }
         $cur = 'A'; 'A' | Out-File -Encoding ascii -NoNewline "$BASE\current.txt"
         Log "首次运行:当前登录状态已收编为账号A"
+        $justArchived = $true
         "NOTE:已将当前登录收编为账号A"
     }
 
-    if ($cur -eq $target) { Start-ClaudeApp; "INFO:当前已是账号$target"; return }
+    if ($cur -eq $target) {
+        if (-not (Test-Path $DATA) -and (Test-Path "$BASE\accounts\$target")) {
+            if (-not (Load-Account $target)) { "FAIL:$($script:SwitchError)"; return }
+        }
+        if (-not (Start-ClaudeApp)) { "WARN:未找到 Claude 可执行文件，请手动启动" }
+        "INFO:当前已是账号$target"
+        return
+    }
 
     if (-not (Stop-ClaudeApp)) { "FAIL:Claude 未能退出，请手动退出后重试"; return }
 
-    if ($cur -ne 'none' -and (Test-Path $DATA)) { Save-Account $cur }
+    if (-not $justArchived -and $cur -ne 'none' -and (Test-Path $DATA)) {
+        if (-not (Save-Account $cur)) { "FAIL:$($script:SwitchError)"; return }
+    }
 
     if (Test-Path "$BASE\accounts\$target") {
-        Remove-Item $DATA -Recurse -Force -ErrorAction SilentlyContinue
-        robocopy "$BASE\accounts\$target" "$DATA" /E /NFL /NDL /NJH /NJS | Out-Null
-        Log "已载入账号$target 存档"
+        if (-not (Load-Account $target)) { "FAIL:$($script:SwitchError)"; return }
     } else {
-        Remove-Item $DATA -Recurse -Force -ErrorAction SilentlyContinue
-        New-Item -ItemType Directory -Force -Path $DATA | Out-Null
-        Log "账号$target 无存档，将以全新状态初始化"
+        if (-not (New-AccountData $target)) { "FAIL:$($script:SwitchError)"; return }
     }
     $target | Out-File -Encoding ascii -NoNewline "$BASE\current.txt"
-    Start-ClaudeApp
+    if (-not (Start-ClaudeApp)) { "WARN:已切换但未找到 Claude 可执行文件，请手动启动" }
     Log "已切换到账号$target 并启动"
     "OK:已切换到账号$target"
 }

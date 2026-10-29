@@ -121,6 +121,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.claude-sw
 - 界面是 WPF 重写的第一版,样式以 Mac 版为准对齐,细节可能有出入
 - Clash Verge 的 TUN 开关在 Windows 上如果被更新重置,目前需要手动在设置里重新打开(一键修复会提示)
 - 账号快照切换前请确保 Claude 已完全退出(托盘图标也要退出)
+- 切换账号改为「先复制到暂存目录、校验成功后再整体换位」:中途失败或取消不会删除当前数据。若看到 `accounts\<槽位>.new` / `.previous` 或 `Claude.new` / `Claude.old` 残留,说明上次切换被中断,先确认数据再清理
+- WebRTC 检查在 STUN 全部无响应时显示 `warn:STUN 无响应,未确认 UDP 出口`(与 macOS 版一致)——「探测不到」不等于「零暴露」
 - 旧版切换器可能在 `Merge.yaml` 留下 `prepend-rules` / 多文档 `---`，导致 Clash 报 `Merge.yaml ... containing more than one document` 或 TUN 异常。当前「一键修复」会自动备份并清理这些遗留内容，规则模式改用 `Script.js`，不再写 `Merge.yaml`；全局/直连模式跳过规则，只在需要清理旧 Merge 时重启一次
 - 「一键修复」在规则模式写入/清理后会重启 Clash Verge（任务栏/托盘图标会短暂消失，属正常）；全局模式仅在清理历史 Merge 时重启。规则模式重启后会验证内核 `/rules` 前 16 条，失败自动回滚 `Script.js`；控制接口不可用时只提示“无法验证”，不会谎报成功
 - **`auto` / `other` 的 TUN 判定是通用启发式**:只要有一块处于 `Up` 状态、描述里带 `TAP/TUN/WireGuard/Wintun/VPN/Tailscale` 的网卡就会判定 TUN 在线,无法区分"代理隧道已接管"还是"某块虚拟网卡只是存在"。可能误判(例如虚拟网卡残留、其他 VPN 适配器),此时请把 `$PROXY_MODE` 改成实际客户端后重跑安装器;若仍不稳定,可在计划任务中暂停 `ClaudeBodyguard`
