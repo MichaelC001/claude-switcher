@@ -171,7 +171,7 @@ function Switch-To($t) {
     $win.FindName('Banner').Text = "正在切换到账号 $t…（归档约需几十秒）"
     $win.Dispatcher.Invoke([action]{}, 'Render')
     $r = Invoke-Core @('switch', $t)
-    if ($r -match '^FAIL:') {
+    if ($r -match '(?m)^FAIL:') {
         Set-Status '检查未过' ([System.Windows.Media.Color]::FromRgb(0xF8,0x71,0x71))
         $win.FindName('Banner').Text = $r
     } else {
