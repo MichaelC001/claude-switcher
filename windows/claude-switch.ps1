@@ -1852,6 +1852,232 @@ function Invoke-ProxyDiagnostics([string[]]$DiagnosticArgs) {
     $script:exitCode = if ($reachedAll) { 0 } else { 1 }
 }
 
+function Read-SnapshotPassword([string]$Mode, [string]$Prompt = '输入快照密码') {
+    if ($Mode -eq '--password-stdin') { return [Console]::In.ReadLine() }
+    $secure = Read-Host $Prompt -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+}
+
+function Get-SnapshotKeys([string]$Password, [byte[]]$Salt) {
+    $passwordBytes = [System.Text.Encoding]::UTF8.GetBytes($Password)
+    try {
+        $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes -ArgumentList $passwordBytes,$Salt,200000,[System.Security.Cryptography.HashAlgorithmName]::SHA256
+        try { $material = $kdf.GetBytes(64) } finally { $kdf.Dispose() }
+        $encryptionKey = New-Object byte[] 32
+        $macKey = New-Object byte[] 32
+        [Array]::Copy($material, 0, $encryptionKey, 0, 32)
+        [Array]::Copy($material, 32, $macKey, 0, 32)
+        [Array]::Clear($material, 0, $material.Length)
+        return [pscustomobject]@{ encryption = $encryptionKey; mac = $macKey }
+    } finally {
+        [Array]::Clear($passwordBytes, 0, $passwordBytes.Length)
+    }
+}
+
+function Get-SnapshotMac([string]$Path, [byte[]]$Key) {
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList (,$Key)
+    try {
+        $header = New-Object byte[] 40
+        $offset = 0
+        while ($offset -lt 40) {
+            $read = $stream.Read($header, $offset, 40 - $offset)
+            if ($read -le 0) { throw '快照头不完整' }
+            $offset += $read
+        }
+        [void]$hmac.TransformBlock($header, 0, $header.Length, $header, 0)
+        $stream.Position = 72
+        $buffer = New-Object byte[] 1048576
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            [void]$hmac.TransformBlock($buffer, 0, $read, $buffer, 0)
+        }
+        [void]$hmac.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+        return ,$hmac.Hash
+    } finally {
+        $hmac.Dispose(); $stream.Dispose()
+    }
+}
+
+function Protect-SnapshotFile([string]$PlainPath, [string]$Destination, [string]$Password) {
+    $salt = New-Object byte[] 16; $iv = New-Object byte[] 16
+    $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $random.GetBytes($salt); $random.GetBytes($iv) } finally { $random.Dispose() }
+    $keys = Get-SnapshotKeys $Password $salt
+    $input = [System.IO.File]::OpenRead($PlainPath)
+    $output = [System.IO.File]::Open($Destination, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        $magic = [System.Text.Encoding]::ASCII.GetBytes('CSNAP001')
+        $output.Write($magic, 0, $magic.Length); $output.Write($salt, 0, $salt.Length); $output.Write($iv, 0, $iv.Length)
+        $placeholder = New-Object byte[] 32
+        $output.Write($placeholder, 0, $placeholder.Length)
+        $aes = [System.Security.Cryptography.Aes]::Create()
+        $aes.KeySize = 256; $aes.Key = $keys.encryption; $aes.IV = $iv
+        $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+        $crypto = New-Object System.Security.Cryptography.CryptoStream($output, $aes.CreateEncryptor(), [System.Security.Cryptography.CryptoStreamMode]::Write)
+        try { $input.CopyTo($crypto) } finally { $crypto.Dispose(); $aes.Dispose() }
+    } finally {
+        $input.Dispose(); $output.Dispose()
+    }
+    $hash = Get-SnapshotMac $Destination $keys.mac
+    $output = [System.IO.File]::Open($Destination, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try { $output.Position = 40; $output.Write($hash, 0, $hash.Length); $output.Flush() } finally { $output.Dispose() }
+}
+
+function Test-SnapshotAuthentication([string]$Path, [string]$Password) {
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        try {
+            if ($stream.Length -lt 73) { return @{ ok = $false } }
+            $header = New-Object byte[] 72
+            $offset = 0
+            while ($offset -lt 72) {
+                $read = $stream.Read($header, $offset, 72 - $offset)
+                if ($read -le 0) { return @{ ok = $false } }
+                $offset += $read
+            }
+            $magic = [System.Text.Encoding]::ASCII.GetString($header, 0, 8)
+            if ($magic -ne 'CSNAP001') { return @{ ok = $false } }
+            $salt = New-Object byte[] 16; $iv = New-Object byte[] 16; $expected = New-Object byte[] 32
+            [Array]::Copy($header, 8, $salt, 0, 16); [Array]::Copy($header, 24, $iv, 0, 16); [Array]::Copy($header, 40, $expected, 0, 32)
+        } finally { $stream.Dispose() }
+        $keys = Get-SnapshotKeys $Password $salt
+        $actual = Get-SnapshotMac $Path $keys.mac
+        $difference = 0
+        for ($i = 0; $i -lt 32; $i++) { $difference = $difference -bor ($actual[$i] -bxor $expected[$i]) }
+        if ($difference -ne 0) { return @{ ok = $false } }
+        return @{ ok = $true; keys = $keys; iv = $iv }
+    } catch { return @{ ok = $false } }
+}
+
+function Unprotect-SnapshotFile([string]$Path, [string]$PlainPath, [string]$Password) {
+    $auth = Test-SnapshotAuthentication $Path $Password
+    if (-not $auth.ok) { return $false }
+    try {
+        $input = [System.IO.File]::OpenRead($Path)
+        $output = [System.IO.File]::Open($PlainPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        try {
+            $input.Position = 72
+            $aes = [System.Security.Cryptography.Aes]::Create()
+            $aes.KeySize = 256; $aes.Key = $auth.keys.encryption; $aes.IV = $auth.iv
+            $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC; $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+            $crypto = New-Object System.Security.Cryptography.CryptoStream($input, $aes.CreateDecryptor(), [System.Security.Cryptography.CryptoStreamMode]::Read)
+            try { $crypto.CopyTo($output) } finally { $crypto.Dispose(); $aes.Dispose() }
+        } finally { $input.Dispose(); $output.Dispose() }
+        return $true
+    } catch {
+        Remove-Item -LiteralPath $PlainPath -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+}
+
+function Test-SnapshotArchive([string]$ZipPath, [string]$Target) {
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $stream = [System.IO.File]::OpenRead($ZipPath)
+    $zip = New-Object System.IO.Compression.ZipArchive($stream, [System.IO.Compression.ZipArchiveMode]::Read)
+    try {
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $marker = $null
+        foreach ($entry in $zip.Entries) {
+            $name = [string]$entry.FullName
+            if (-not $name -or $name.Contains('\') -or [System.IO.Path]::IsPathRooted($name) -or $name.StartsWith('/') -or $name -match '^[A-Za-z]:') { throw '快照包含非法路径' }
+            $parts = $name.Split('/')
+            if ($parts -contains '..') { throw '快照包含越界路径' }
+            $fileType = ([uint32]$entry.ExternalAttributes -shr 16) -band 0xF000
+            if ($fileType -eq 0xA000) { throw '快照包含符号链接' }
+            if (-not $seen.Add($name)) { throw '快照包含重复路径' }
+            if ($name -eq '.claude-switcher-snapshot.json') { $marker = $entry }
+        }
+        if (-not $marker -or $marker.Length -gt 16384) { throw '缺少快照元数据' }
+        $reader = New-Object System.IO.StreamReader($marker.Open(), [System.Text.Encoding]::UTF8)
+        try { $meta = ($reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop) } finally { $reader.Dispose() }
+        if ($meta.format -ne 'claude-switcher-snapshot' -or [int]$meta.version -ne 1) { throw '快照格式不支持' }
+        if ([string]$meta.account -notmatch '^[A-D]$' -or [string]$meta.account -ne $Target) { throw '账号不匹配或元数据无效' }
+        return $true
+    } finally { $zip.Dispose(); $stream.Dispose() }
+}
+
+function Expand-SnapshotArchive([string]$ZipPath, [string]$Destination) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $Destination)
+}
+
+function Export-EncryptedSnapshot([string]$Target, [string]$Out, [string]$Mode) {
+    if (-not (Test-AccountSlot $Target)) { $script:exitCode = 1; 'FAIL:账号必须是 A、B、C 或 D'; return }
+    $source = Join-Path $BASE "accounts\$Target"
+    if (-not (Test-Path -LiteralPath $source -PathType Container)) { $script:exitCode = 1; "FAIL:账号$Target 没有已归档快照"; return }
+    if ([string]::IsNullOrWhiteSpace($Out)) { $script:exitCode = 1; 'FAIL:请指定导出文件路径'; return }
+    $Out = [System.IO.Path]::GetFullPath($Out)
+    if (Test-Path -LiteralPath $Out) { $script:exitCode = 1; 'FAIL:目标文件已存在，请换一个路径'; return }
+    $current = if (Test-Path "$BASE\current.txt") { (Get-Content "$BASE\current.txt" -Raw).Trim() } else { '' }
+    if ($current -eq $Target) { $script:exitCode = 1; "FAIL:账号$Target 正在使用中，请先切换到另一账号再导出"; return }
+    $password = Read-SnapshotPassword $Mode '设置导出密码(至少 8 位)'
+    if ($Mode -ne '--password-stdin') {
+        $confirm = Read-SnapshotPassword $Mode '再次输入'
+        if ($password -cne $confirm) { $script:exitCode = 1; 'FAIL:两次密码不一致'; return }
+    }
+    if ([string]::IsNullOrEmpty($password) -or $password.Length -lt 8) { $script:exitCode = 1; 'FAIL:密码至少 8 位'; return }
+    $stage = Join-Path $env:TEMP ('claude-snapshot-' + [guid]::NewGuid().ToString('N'))
+    $plain = Join-Path $env:TEMP ('claude-snapshot-' + [guid]::NewGuid().ToString('N') + '.zip')
+    try {
+        $rc = Invoke-Robocopy $source $stage '/E' -ExcludeJunctions
+        if (-not $rc.ok) { throw "复制快照失败(robocopy $($rc.code))" }
+        $meta = [ordered]@{ format = 'claude-switcher-snapshot'; version = 1; account = $Target; created = ([DateTime]::UtcNow.ToString('o')); platform = 'Windows' }
+        [System.IO.File]::WriteAllText((Join-Path $stage '.claude-switcher-snapshot.json'), ($meta | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $plain, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+        Protect-SnapshotFile $plain $Out $password
+        "OK:账号$Target 已加密导出到 $Out"
+    } catch {
+        Remove-Item -LiteralPath $Out -Force -ErrorAction SilentlyContinue
+        $script:exitCode = 1
+        "FAIL:$($_.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $plain -Force -ErrorAction SilentlyContinue
+        $password = $null; $confirm = $null
+    }
+}
+
+function Import-EncryptedSnapshot([string]$File, [string]$Target, [string]$Mode) {
+    if (-not (Test-AccountSlot $Target)) { $script:exitCode = 1; 'FAIL:账号必须是 A、B、C 或 D'; return }
+    if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { $script:exitCode = 1; 'FAIL:找不到快照文件'; return }
+    $destination = Join-Path $BASE "accounts\$Target"
+    $stage = "$BASE\accounts\$target.new"
+    $previous = "$BASE\accounts\$target.previous"
+    foreach ($path in @($destination, $stage, $previous)) {
+        if (Test-Path -LiteralPath $path) { $script:exitCode = 1; "FAIL:账号$Target 已有快照或待恢复数据，拒绝覆盖"; return }
+    }
+    $password = Read-SnapshotPassword $Mode '输入快照密码'
+    if ([string]::IsNullOrEmpty($password)) { $script:exitCode = 1; 'FAIL:密码为空'; return }
+    $plain = Join-Path $env:TEMP ('claude-import-' + [guid]::NewGuid().ToString('N') + '.zip')
+    $extract = Join-Path $env:TEMP ('claude-import-' + [guid]::NewGuid().ToString('N'))
+    $ownsStage = $false
+    try {
+        if (-not (Unprotect-SnapshotFile $File $plain $password)) { throw '密码错误或快照损坏' }
+        if (-not (Test-SnapshotArchive $plain $Target)) { throw '快照元数据校验失败' }
+        Expand-SnapshotArchive $plain $extract
+        Remove-Item -LiteralPath (Join-Path $extract '.claude-switcher-snapshot.json') -Force -ErrorAction Stop
+        $ownsStage = $true
+        $rc = Invoke-Robocopy $extract $stage '/E' -ExcludeJunctions
+        if (-not $rc.ok) { throw "写入账号目录失败(robocopy $($rc.code))" }
+        Move-Item -LiteralPath $stage -Destination $destination -ErrorAction Stop
+        $ownsStage = $false
+        "OK:已导入为账号$Target(切换时生效)"
+    } catch {
+        if ($ownsStage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+        $script:exitCode = 1
+        "FAIL:$($_.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $plain -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $extract -Recurse -Force -ErrorAction SilentlyContinue
+        $password = $null
+    }
+}
+
 function Get-ReleaseInfo {
     $current = Get-AppVersion
     try {
@@ -2089,6 +2315,8 @@ try {
         'fingerprint'  { Get-Fingerprint }
         'cli-info'     { Get-CliInfo }
         'open-safe'    { Open-SafeUrl $args[1] }
+        'snapshot-export' { Export-EncryptedSnapshot $args[1] $args[2] $args[3] }
+        'snapshot-import' { Import-EncryptedSnapshot $args[1] $args[2] $args[3] }
         'diagnose-proxy' {
             $diagnosticArgs = if ($args.Count -gt 1) { @($args[1..($args.Count - 1)]) } else { @() }
             Invoke-ProxyDiagnostics $diagnosticArgs
