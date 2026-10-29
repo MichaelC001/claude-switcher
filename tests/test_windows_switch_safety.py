@@ -49,6 +49,18 @@ class WindowsSwitchSafetyTests(unittest.TestCase):
         self.assertIn('$stage = "$DATA.new"', self.core)
         self.assertIn('$old = "$DATA.old"', self.core)
 
+    def test_interrupted_switch_artifacts_are_never_deleted(self):
+        for name in ("Load-Account", "New-AccountData"):
+            body = self.core[self.core.index(f"function {name}"):]
+            body = body[:body.index("\nfunction ")]
+            self.assertIn("if (Test-Path -LiteralPath $stage)", body,
+                          f"{name} 必须先拒绝已存在的暂存目录")
+            self.assertIn("存在待恢复数据，拒绝覆盖", body)
+        switch_body = self.core[self.core.index("function Switch-DataDir"):]
+        switch_body = switch_body[:switch_body.index("\nfunction ")]
+        self.assertIn("if (Test-Path -LiteralPath $old)", switch_body)
+        self.assertIn("存在待恢复数据，拒绝覆盖", switch_body)
+
     def test_archive_commits_before_target_is_loaded(self):
         # 主切换路径：先归档当前账号，最后一次载入目标账号必须在其后
         self.assertLess(

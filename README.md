@@ -272,7 +272,7 @@ skills/
 
 支持 `clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto`。改完重新跑一次 `checkdetail` 即可：
 
-- 换成 FlClash 后，「代理内核」检查 `FlClashCore`/`FlClash` 进程；WebRTC 判定采用 FlClash 的 STUN/TURN UDP REJECT 规则（探测无响应视为已拒绝，不误报）
+- 换成 FlClash 后，「代理内核」与保镖识别 `FlClashCore`/`FlClash` 进程；WebRTC 与其他非 Clash Verge 客户端一致，STUN 无响应显示「未确认」，不会把未验证当作已安全拒绝
 - 换成 Shadowrocket 后，「代理内核」检查 `scutil --nc` 的连接状态，不再去找 Clash Verge
 - 非 Clash 客户端不做配置改写，「规则置顶」改用 fake-ip 行为检测；不通过时按提示在客户端里手动添加 Claude 域名规则
 - 「保镖」现在会核对运行中 LaunchDaemon 与 root 所有的保镖脚本内 `MODE`，不再只看进程是否存在；客户端模式不一致时显示 `fail:客户端不一致`，此时需手动重跑 `installer/安装.command` 同步保镖（需要管理员权限）。`fix` 只能启动缺失的 LaunchDaemon，**不会更新已有 root 脚本内的旧模式**；在重新检查通过前不要启动 Claude。

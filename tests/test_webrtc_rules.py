@@ -370,7 +370,7 @@ open() { echo repair-called >&2; exit 99; }
         self.assertNotIn("repair-called", run.stdout + run.stderr)
         self.assertIn("invalid policy", run.stdout + run.stderr)
 
-    def run_status(self, *, verified=True, result="RESULT:203.0.113.1", probe_rc=0):
+    def run_status(self, *, verified=True, result="RESULT:203.0.113.1", probe_rc=0, mode="clash-verge"):
         source = SOURCE.read_text(encoding="utf-8")
         match = re.search(r"(?ms)^webrtc_status\(\) \{\n.*?^\}", source)
         self.assertIsNotNone(match, "audit and repair must share WebRTC assessment")
@@ -378,19 +378,24 @@ open() { echo repair-called >&2; exit 99; }
                 if os.name == "nt" else "/bin/bash")
         code = r'''
 set -u
-PROXY_MODE=clash-verge
+PROXY_MODE="$PROXY_MODE"
 clash_rules() {
     case "$1" in
         verify) if [ "$VERIFY_RC" = 0 ]; then echo OK; else echo 'FAIL:runtime not verified' >&2; return 1; fi ;;
-        assess) printf 'ok:assessed:%s:%s\n' "$3" "$4" ;;
+        assess) if [ "$3" = 'RESULT:NONE' ]; then printf 'warn:STUN 无响应,未确认 UDP 出口\n'; else printf 'ok:assessed:%s:%s\n' "$3" "$4"; fi ;;
     esac
 }
 webrtc_test() { echo probe-called >&2; printf '%s' "$PROBE_RESULT"; return "$PROBE_RC"; }
 '''
         env = dict(os.environ, VERIFY_RC="0" if verified else "1", PROBE_RESULT=result,
-                   PROBE_RC=str(probe_rc), LC_ALL="C")
+                   PROBE_RC=str(probe_rc), PROXY_MODE=mode, LC_ALL="C")
         return subprocess.run([bash, "-c", code + match.group(0) + '\nwebrtc_status "203.0.113.1"'],
                               env=env, text=True, encoding="utf-8", capture_output=True, timeout=5)
+
+    def test_flclash_no_response_is_unverified_not_safely_rejected(self):
+        run = self.run_status(result="RESULT:NONE", mode="flclash")
+        self.assertTrue(run.stdout.startswith("warn:"), run.stdout + run.stderr)
+        self.assertNotIn("已按规则拒绝", run.stdout)
 
     def test_unverified_rules_do_not_launch_stun_probe(self):
         run = self.run_status(verified=False)

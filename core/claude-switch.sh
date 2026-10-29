@@ -853,25 +853,6 @@ webrtc_test() {
 # 日常检查与修复共用此判断。先确认规则，再允许探测，避免向已知直连路径发包。
 webrtc_status() {
     local verified result probe_rc assessment mode leak wips w
-    # FlClash 当前采用明确的 STUN/TURN UDP REJECT 规则；无响应表示已被拒绝，
-    # 不把它误报成"无法确认"。若节点实际返回地址，必须与当前代理出口一致。
-    if [ "$PROXY_MODE" = "flclash" ]; then
-        result=$(webrtc_test)
-        probe_rc=$?
-        [ "$probe_rc" -ne 0 ] && { echo "fail:STUN 探测执行失败，未确认 UDP 出口"; return; }
-        case "$result" in
-            RESULT:NONE) echo 'ok:FlClash 已按规则拒绝 STUN UDP，未发现直连地址' ;;
-            RESULT:*)
-                leak=""
-                wips=${result#RESULT:}
-                OLDIFS=$IFS; IFS=','
-                for w in $wips; do [ -n "$1" ] && [ "$w" != "$1" ] && leak="$leak $w"; done
-                IFS=$OLDIFS
-                if [ -n "$leak" ]; then echo "fail:STUN 暴露非代理IP:${leak# }"; else echo 'ok:STUN 仅返回代理出口地址'; fi ;;
-            *) echo 'fail:STUN 探测结果格式异常' ;;
-        esac
-        return
-    fi
     if [ "$PROXY_MODE" = "clash-verge" ]; then
         mode=$(clash_mode)
         # 全局模式不经过规则匹配,直接按"STUN 结果是否等于当前出口"判断
@@ -910,7 +891,7 @@ webrtc_status() {
         assessment=$(WEBRTC_POLICY=proxy clash_rules assess "$1" "$result" "$probe_rc" 2>/dev/null)
     fi
     case "$assessment" in
-        ok:*|fail:*) echo "$assessment" ;;
+        ok:*|warn:*|fail:*) echo "$assessment" ;;
         *) echo 'fail:无法评估 STUN 结果' ;;
     esac
 }

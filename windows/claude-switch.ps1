@@ -1042,17 +1042,23 @@ function Stop-ClaudeApp {
 # 数据目录换位:新目录先备好,再用两次 rename 提交;失败回滚，任何时候都不先删当前数据
 function Switch-DataDir([string]$Stage) {
     $old = "$DATA.old"
-    if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $old) {
+        return (Set-SwitchError "存在待恢复数据，拒绝覆盖:$old(确认数据归属后手动恢复或清理)")
+    }
     if (Test-Path -LiteralPath $DATA) {
         try { Move-Item -LiteralPath $DATA -Destination $old -ErrorAction Stop }
         catch { return (Set-SwitchError "当前数据目录无法移开:$($_.Exception.Message)") }
     }
     try { Move-Item -LiteralPath $Stage -Destination $DATA -ErrorAction Stop }
     catch {
-        if (Test-Path -LiteralPath $old) { Move-Item -LiteralPath $old -Destination $DATA -ErrorAction SilentlyContinue }
-        return (Set-SwitchError "新数据目录提交失败，已回滚:$($_.Exception.Message)")
+        $commitError = $_.Exception.Message
+        if (Test-Path -LiteralPath $old) {
+            try { Move-Item -LiteralPath $old -Destination $DATA -ErrorAction Stop }
+            catch { return (Set-SwitchError "新数据目录提交失败，当前数据保留在:$old；自动回滚失败:$($_.Exception.Message)") }
+        }
+        return (Set-SwitchError "新数据目录提交失败，已回滚:$commitError")
     }
-    if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction Stop }
     return $true
 }
 
@@ -1098,7 +1104,9 @@ function Load-Account([string]$name) {
     $source = "$BASE\accounts\$name"
     $stage = "$DATA.new"
     if (-not (Test-Path -LiteralPath $source)) { return (Set-SwitchError "账号$name 没有可用快照") }
-    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $stage) {
+        return (Set-SwitchError "存在待恢复数据，拒绝覆盖:$stage(确认数据归属后手动恢复或清理)")
+    }
     $rc = Invoke-Robocopy $source $stage '/E'
     if (-not $rc.ok) {
         Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
@@ -1116,7 +1124,9 @@ function Load-Account([string]$name) {
 # 空槽位:用空目录换位，不先删当前数据
 function New-AccountData([string]$name) {
     $stage = "$DATA.new"
-    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $stage) {
+        return (Set-SwitchError "存在待恢复数据，拒绝覆盖:$stage(确认数据归属后手动恢复或清理)")
+    }
     if (-not (New-Item -ItemType Directory -Force -Path $stage -ErrorAction SilentlyContinue)) {
         return (Set-SwitchError "无法创建账号$name 数据目录")
     }

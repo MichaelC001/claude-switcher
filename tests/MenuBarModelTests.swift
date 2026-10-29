@@ -44,6 +44,7 @@ private final class Fixture {
         case "$1" in
           checkdetail) delay check; cat "$root/audit"; result check ;;
           status) cat "$root/status"; result status ;;
+          get-client) echo 'client=clash-verge' ;;
           switch) delay switch; cat "$root/switch-output"; result switch ;;
           fix) delay fix; echo 'FIX:演示修复完成'; result fix ;;
           fingerprint) delay fingerprint; echo 'GPU=ok:演示设备' ;;
@@ -95,7 +96,7 @@ struct MenuBarModelTests {
                 let vm = f.vm()
                 vm.start(); vm.start()
                 try f.idle(vm)
-                try expect(f.calls == ["checkdetail", "status"], "启动不应重复检查")
+                try expect(f.calls == ["checkdetail", "get-client", "status"], "启动不应重复检查")
                 try expect(vm.phase == .ready && vm.lastCheckSummary == "通过" && vm.current == "A", "初始状态不一致")
             case "multi_account_status":
                 try f.write("status", "current=A hasA=1 hasB=1 hasC=1 hasD=0 accounts=A,B,C accA=1.2G@2026-10-20 accB=900M@2026-10-19 accC=2.0G@2026-10-18\n")
@@ -135,7 +136,7 @@ struct MenuBarModelTests {
                 vm.switchTo("B")
                 try f.idle(vm)
                 try expect(vm.lastCheckSummary == "有警告" && vm.current == "B", "警告应展示并允许切换")
-                try expect(f.calls == ["checkdetail", "status", "switch B"], "切换前必须先完整审计")
+                try expect(f.calls == ["checkdetail", "get-client", "status", "switch B"], "切换前必须先完整审计")
             case "local_status_refresh":
                 let vm = f.vm()
                 vm.refreshAccountStatus()
@@ -143,7 +144,7 @@ struct MenuBarModelTests {
                 vm.start(); try f.idle(vm)
                 try f.write("status", "current=B hasA=1 hasB=1\n")
                 vm.refreshAccountStatus(); try f.idle(vm)
-                try expect(f.calls == ["checkdetail", "status", "status"], "展开菜单只应读取本地状态")
+                try expect(f.calls == ["checkdetail", "get-client", "status", "status"], "展开菜单只应读取本地状态")
                 try expect(vm.current == "B" && vm.lastCheckSummary == "通过", "账号更新不应改变上次审计结果")
             case "fresh_audit":
                 let vm = f.vm()
@@ -218,7 +219,7 @@ struct MenuBarModelTests {
                 try expect(!vm.canQuit, "切换请求开始后不可退出")
                 vm.switchTo("A"); vm.refresh(); vm.fixAll(); vm.inspectFingerprint()
                 try f.idle(vm)
-                try expect(f.calls == ["checkdetail", "status", "switch B"], "忙碌时应忽略重复操作")
+                try expect(f.calls == ["checkdetail", "get-client", "status", "switch B"], "忙碌时应忽略重复操作")
                 try expect(vm.canQuit && vm.current == "B", "切换完成后应允许退出")
             case "fix_guard":
                 try f.write("fix-delay", "0.2")
@@ -227,7 +228,7 @@ struct MenuBarModelTests {
                 try expect(!vm.canQuit, "修复期间不可退出")
                 vm.refresh(); vm.switchTo("B"); vm.fixAll()
                 try f.idle(vm)
-                try expect(f.calls == ["fix", "checkdetail", "status"], "修复结束必须重新检查，不能并行执行")
+                try expect(f.calls == ["fix", "checkdetail", "get-client", "status"], "修复结束必须重新检查，不能并行执行")
                 try expect(vm.canQuit && vm.phase == .ready, "修复后应该可以退出")
             case "failed_fix":
                 try f.write("fix-exit", "1")

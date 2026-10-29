@@ -13,6 +13,8 @@ ifconfig 2>/dev/null | grep -q 'inet 198\.18\.' || ok=0
 case "$MODE" in
     clash-verge)
         pgrep -f verge-mihomo >/dev/null 2>&1 || ok=0 ;;
+    flclash)
+        { pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1; } || ok=0 ;;
     shadowrocket)
         # launchd 环境下 scutil 可能查不到 VPN 行,查不到时以 TUN 判定为准(避免误杀)
         nc=$(scutil --nc list 2>/dev/null)

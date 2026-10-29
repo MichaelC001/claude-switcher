@@ -43,7 +43,7 @@ class SetClientTests(unittest.TestCase):
         return ""
 
     def test_switches_mode(self):
-        for mode in ("shadowrocket", "sing-box", "auto", "clash-verge"):
+        for mode in ("shadowrocket", "sing-box", "flclash", "auto", "clash-verge"):
             result = self.run_set(mode)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(self.current_mode(), mode)
@@ -53,6 +53,26 @@ class SetClientTests(unittest.TestCase):
         result = self.run_set("not-a-client")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.current_mode(), before)
+
+    def test_flclash_bodyguard_recognizes_its_core(self):
+        guard = (ROOT / "daemons" / "claude-bodyguard.sh").read_text(encoding="utf-8")
+        guard = guard.replace("__HOME__", str(self.root)).replace("__PROXY_MODE__", "flclash")
+        script = self.root / "installed-bodyguard.sh"
+        script.write_text(guard, encoding="utf-8")
+        (self.root / "Library" / "Logs").mkdir(parents=True)
+        (self.fakebin / "ifconfig").write_text("#!/bin/sh\necho 'inet 198.18.0.1'\n", encoding="utf-8")
+        (self.fakebin / "pgrep").write_text(
+            "#!/bin/sh\ncase \"$*\" in *FlClashCore*|*Claude.app*) exit 0 ;; *) exit 1 ;; esac\n",
+            encoding="utf-8")
+        (self.fakebin / "pkill").write_text("#!/bin/sh\ntouch \"$CLAUDE_SWITCHER_TEST_ROOT/pkill-called\"\n", encoding="utf-8")
+        for name in ("ifconfig", "pgrep", "pkill"):
+            (self.fakebin / name).chmod(0o755)
+        env = dict(os.environ, HOME=str(self.root), CLAUDE_SWITCHER_TEST_ROOT=str(self.root),
+                   PATH=f"{self.fakebin}:/usr/bin:/bin")
+        run = subprocess.run(["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertFalse((self.root / "pkill-called").exists(),
+                         "FlClash 在线时保镖不得按 Clash Verge 进程误杀 Claude")
 
 
     def test_warns_when_installed_bodyguard_mode_stale(self):
