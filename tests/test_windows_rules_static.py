@@ -247,13 +247,13 @@ class WindowsRulesStaticTests(unittest.TestCase):
 
     def test_ui_shows_fix_rule_output_in_banner(self):
         text = read(UI)
-        self.assertIn("$fixOut = Invoke-Core @('fix')", text)
-        self.assertIn("$ruleLine", text)
+        self.assertIn("Start-CommandOperation 'fix' @('fix')", text)
+        self.assertIn("$line", text)
         self.assertIn("Banner", text)
         self.assertIn("FAIL|✗|无法|未恢复|未完全|未找到", text)
         self.assertIn("模式|规则|TUN", text)
-        # 避免中文经控制台代码页转码,fix 输出落盘后读取
-        self.assertIn("last-fix.txt", text)
+        # 后台进程直接使用 UTF-8 管道，避免中文经控制台代码页转码
+        self.assertIn("StandardOutputEncoding = [Text.Encoding]::UTF8", text)
         self.assertIn("last-fix.txt", read(CORE))
 
     def test_readme_describes_mode_aware_behavior(self):
