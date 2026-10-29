@@ -19,8 +19,8 @@ $CLASH_DIR = @(
     (Join-Path $env:LOCALAPPDATA "io.github.clash-verge-rev.clash-verge-rev")
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $CLASH_DIR) { $CLASH_DIR = Join-Path $env:APPDATA "io.github.clash-verge-rev.clash-verge-rev" }
-# check-update 必须只读:不在检查路径上创建任何目录
-if ($args.Count -eq 0 -or $args[0] -ne 'check-update') {
+# check-update / rules-status 必须只读:不在检查路径上创建任何目录
+if ($args.Count -eq 0 -or ($args[0] -ne 'check-update' -and $args[0] -ne 'rules-status')) {
     New-Item -ItemType Directory -Force -Path "$BASE\accounts" | Out-Null
 }
 
@@ -441,8 +441,9 @@ function Get-YamlScalar([string]$path, [string]$key) {
 
 # 解析 Clash 控制接口;Windows 版不使用 unix socket
 function Get-ClashApi {
-    foreach ($name in @('clash-verge.yaml', 'config.yaml')) {
+    foreach ($name in @('clash-verge.yaml', 'config.yaml', 'verge.yaml')) {
         $yaml = Join-Path $CLASH_DIR $name
+        if (-not (Test-Path -LiteralPath $yaml)) { continue }
         $addr = Get-YamlScalar $yaml 'external-controller'
         if ([string]::IsNullOrWhiteSpace($addr)) { continue }
         if ($addr -match '^unix://' -or $addr -match '^/') { continue }
@@ -453,23 +454,61 @@ function Get-ClashApi {
         $secret = Get-YamlScalar $yaml 'secret'
         $headers = @{}
         if (-not [string]::IsNullOrWhiteSpace($secret)) { $headers['Authorization'] = 'Bearer ' + $secret }
-        return @{ base = $base; headers = $headers }
+        return @{ base = $base; headers = $headers; source = $name }
     }
     return $null
+}
+
+# 把控制接口异常归类成可执行的原因,供规则检查与 rules-status 复用
+function Get-ClashApiError($err) {
+    $status = $null
+    try { if ($err.Response) { $status = [int]$err.Response.StatusCode } } catch {}
+    if (-not $status) {
+        $m = [regex]::Match([string]$err.Message, '\b(401|403|404|429|500|502|503|504)\b')
+        if ($m.Success) { $status = [int]$m.Value }
+    }
+    if ($status -eq 401 -or $status -eq 403) { return 'auth-failed' }
+    if ($status) { return "http-$status" }
+
+    $text = [string]$err.Message
+    try { if ($err.InnerException) { $text = $text + ' ' + [string]$err.InnerException.Message } } catch {}
+    if ($text -match 'timed out|timeout|超时') { return 'timeout' }
+    if ($text -match 'refused|拒绝|Unable to connect|No connection could be made|无法连接') { return 'connect-failed' }
+    return 'error'
+}
+
+# 统一的控制接口调用:返回 ok/reason/data,调用方不必各自 try/catch
+function Invoke-ClashApi([string]$Path, [int]$TimeoutSec = 8) {
+    $api = Get-ClashApi
+    if (-not $api) { return @{ ok = $false; reason = 'no-endpoint'; data = $null; endpoint = ''; source = '' } }
+    try {
+        $params = @{ Uri = ($api.base + $Path); TimeoutSec = $TimeoutSec; ErrorAction = 'Stop' }
+        if ($api.headers.Count -gt 0) { $params['Headers'] = $api.headers }
+        $data = Invoke-RestMethod @params
+        return @{ ok = $true; reason = ''; data = $data; endpoint = $api.base; source = $api.source }
+    } catch {
+        return @{ ok = $false; reason = (Get-ClashApiError $_.Exception); data = $null; endpoint = $api.base; source = $api.source }
+    }
+}
+
+function Get-ClashApiHint([string]$reason) {
+    switch ($reason) {
+        'no-endpoint'    { return '控制接口未配置:检查 Clash Verge 的 external-controller' }
+        'connect-failed' { return '控制接口拒绝连接:Verge 未开外部控制或端口不对' }
+        'auth-failed'    { return '控制接口鉴权失败:secret 不匹配' }
+        'timeout'        { return '控制接口超时:内核无响应或 /rules 过大' }
+        ''               { return '控制接口不可用' }
+        default         { return "控制接口异常($reason)" }
+    }
 }
 
 # 返回 global|rule|direct|unknown;API 优先,失败再读 YAML
 function Get-ClashMode {
     try {
-        $api = Get-ClashApi
-        if ($api) {
-            try {
-                $params = @{ Uri = ($api.base + '/configs'); TimeoutSec = 3; ErrorAction = 'Stop' }
-                if ($api.headers.Count -gt 0) { $params['Headers'] = $api.headers }
-                $resp = Invoke-RestMethod @params
-                $m = ([string]$resp.mode).Trim().ToLowerInvariant()
-                if ($m -eq 'global' -or $m -eq 'rule' -or $m -eq 'direct') { return $m }
-            } catch {}
+        $probe = Invoke-ClashApi '/configs' 3
+        if ($probe.ok) {
+            $m = ([string]$probe.data.mode).Trim().ToLowerInvariant()
+            if ($m -eq 'global' -or $m -eq 'rule' -or $m -eq 'direct') { return $m }
         }
         foreach ($name in @('clash-verge.yaml', 'config.yaml', 'verge.yaml')) {
             $p = Join-Path $CLASH_DIR $name
@@ -486,16 +525,9 @@ function Get-ClashMode {
 }
 
 function Get-ClashRules {
-    try {
-        $api = Get-ClashApi
-        if (-not $api) { return @{ available = $false; rules = @() } }
-        $params = @{ Uri = ($api.base + '/rules'); TimeoutSec = 3; ErrorAction = 'Stop' }
-        if ($api.headers.Count -gt 0) { $params['Headers'] = $api.headers }
-        $resp = Invoke-RestMethod @params
-        return @{ available = $true; rules = @($resp.rules) }
-    } catch {
-        return @{ available = $false; rules = @() }
-    }
+    $probe = Invoke-ClashApi '/rules' 8
+    if (-not $probe.ok) { return @{ available = $false; rules = @(); reason = $probe.reason } }
+    return @{ available = $true; rules = @($probe.data.rules); reason = '' }
 }
 
 # 内核前 16 条必须包含 13 个域名 + 3 个端口;兼容 DOMAIN-SUFFIX/DomainSuffix 与 AND(...DST-PORT...) 形式
@@ -765,7 +797,7 @@ function Get-RulesStatus {
         if (Test-PinnedRules $rulesInfo.rules) { return '规则置顶=ok' }
         return '规则置顶=fail:内核未加载置顶规则'
     }
-    if (Test-ClashScriptManaged) { return '规则置顶=warn:规则已写入但无法验证内核加载' }
+    if (Test-ClashScriptManaged) { return "规则置顶=warn:规则已写入但无法验证内核加载($(Get-ClashApiHint $rulesInfo.reason))" }
     return '规则置顶=fail:未配置'
 }
 
@@ -928,7 +960,7 @@ function Invoke-Fix {
                     if (Restart-ClashVerge) {
                         $rulesInfo = Wait-ClashRules 40
                         if (-not $rulesInfo.available) {
-                            "FIX:规则已写入但无法验证内核加载(控制接口不可用)"
+                            "FIX:规则已写入但无法验证内核加载($(Get-ClashApiHint $rulesInfo.reason))"
                         } elseif (Test-PinnedRules $rulesInfo.rules) {
                             "FIX:置顶规则 ✓"
                             Wait-Tun 20 | Out-Null
@@ -1183,6 +1215,42 @@ function Invoke-UpdateNow {
     }
 }
 
+# 只读诊断:控制接口是否可达、Script.js 是否写入、内核前 18 条规则是什么
+function Invoke-RulesStatus {
+    $api = Get-ClashApi
+    "mode=$(Get-ClashMode)"
+    if ($api) {
+        $auth = if ($api.headers.Count -gt 0) { 'configured' } else { 'none' }
+        "api=source=$($api.source) endpoint=$($api.base) auth=$auth"
+    } else {
+        'api=未配置(检查 Clash Verge 的 external-controller)'
+    }
+    $cfg = Invoke-ClashApi '/configs' 5
+    if ($cfg.ok) { "configs=ok mode=$(([string]$cfg.data.mode).ToLowerInvariant())" } else { "configs=fail:$($cfg.reason)" }
+    $info = Get-ClashRules
+    if ($info.available) {
+        $pinned = if (Test-PinnedRules $info.rules) { 'yes' } else { 'no' }
+        "rules=ok count=$(@($info.rules).Count) pinned=$pinned"
+        $i = 0
+        foreach ($r in @($info.rules | Select-Object -First 18)) {
+            $i++
+            "rule{0:d2}={1} {2} -> {3}" -f $i, $r.type, $r.payload, $r.proxy
+        }
+    } else {
+        "rules=fail:$($info.reason)"
+        "hint=$(Get-ClashApiHint $info.reason)"
+    }
+    $scriptPath = Join-Path $CLASH_DIR 'profiles\Script.js'
+    if (Test-Path -LiteralPath $scriptPath) {
+        $managed = if (Test-ClashScriptManaged) { 'yes' } else { 'no' }
+        $stamp = (Get-Item -LiteralPath $scriptPath).LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+        "script=exists managed=$managed modified=$stamp"
+    } else {
+        'script=missing'
+    }
+    Get-RulesStatus
+}
+
 switch ($args[0]) {
     'checkdetail' {
         $r = Invoke-CheckDetail
@@ -1199,5 +1267,6 @@ switch ($args[0]) {
     'set-region'   { Invoke-SetRegion }
     'check-update' { Invoke-CheckUpdate }
     'update-now'   { Invoke-UpdateNow }
-    default        { "用法: claude-switch.ps1 checkdetail|status|fix|switch A|B|set-region|check-update|update-now" }
+    'rules-status' { Invoke-RulesStatus }
+    default        { "用法: claude-switch.ps1 checkdetail|status|fix|switch A|B|set-region|check-update|update-now|rules-status" }
 }
