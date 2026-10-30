@@ -341,6 +341,171 @@ if __name__ == "__main__":
 PY_PROXY_DIAGNOSE
 fi
 
+if [ "${1:-}" = "flclash-repair" ]; then
+    shift
+    exec "${CLAUDE_SWITCHER_PYTHON:-python3}" - "$@" <<'PY_FLCLASH_REPAIR'
+import datetime
+import json
+import re
+import secrets
+import shutil
+import sqlite3
+import sys
+from pathlib import Path
+
+
+DOMAINS = (
+    "claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com",
+    "challenges.cloudflare.com", "datadoghq.com", "segment.io", "stripe.com",
+    "stripe.network", "stripecdn.com", "intercom.io", "intercomcdn.com",
+    "intercomassets.com",
+)
+PORTS = (3478, 5349, 19302)
+REQUIRED_RULE_COLUMNS = {
+    "id", "profile_id", "rule_action", "content", "rule_target",
+    "rule_provider", "sub_rule", "no_resolve", "src", "order",
+}
+
+
+def fail(message):
+    print(f"FAIL:{message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def clean_scalar(value):
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        value = value[1:-1]
+    if not value or re.search(r"[,\r\n\x00-\x1f]", value):
+        fail("代理组名无效")
+    return value
+
+
+def select_group(config, configured):
+    groups = []
+    in_groups = False
+    current = None
+    for line in config.splitlines():
+        if re.match(r"^proxy-groups:\s*(?:#.*)?$", line):
+            in_groups = True
+            continue
+        if in_groups and re.match(r"^[A-Za-z_]", line):
+            break
+        if not in_groups:
+            continue
+        name = re.match(r"^\s*-\s*name:\s*(.+?)\s*$", line)
+        if name:
+            current = clean_scalar(name.group(1))
+            continue
+        if re.match(r"^\s*type:\s*select\s*$", line) and current:
+            groups.append(current)
+            current = None
+    if configured in groups:
+        return configured
+    return groups[0] if groups else "GLOBAL"
+
+
+def current_profile(home):
+    path = home / "shared_preferences.json"
+    try:
+        values = json.loads(path.read_text(encoding="utf-8"))
+        profile_id = values.get("flutter.currentProfileId")
+        if type(profile_id) is not int or profile_id <= 0:
+            fail("无法识别当前 Profile，已保留原配置")
+        return profile_id
+    except (OSError, ValueError, TypeError):
+        fail("无法读取当前 Profile，已保留原配置")
+
+
+def repair(home, configured):
+    if not home.is_dir():
+        fail("FlClash 配置目录不存在")
+    database = home / "database.sqlite"
+    config_path = home / "config.yaml"
+    if not database.is_file() or not config_path.is_file():
+        fail("缺少 FlClash 数据库或运行配置")
+    profile_id = current_profile(home)
+    config = config_path.read_text(encoding="utf-8")
+    if not re.search(r"enhanced-mode:\s*fake-ip\b|fake-ip:\s*true\b", config, re.I):
+        fail("请先在 FlClash 中启用 fake-IP，再执行修复")
+    target = select_group(config, configured)
+    backup = None
+    try:
+        with sqlite3.connect(database, timeout=5) as db:
+            db.execute("PRAGMA busy_timeout=5000")
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version < 17 or version > 21:
+                fail("FlClash 数据库版本不受支持，已保留原配置")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(rules)")}
+            if not REQUIRED_RULE_COLUMNS.issubset(columns):
+                fail("FlClash 规则表结构不受支持，已保留原配置")
+            if not db.execute("SELECT 1 FROM profiles WHERE id=?", (profile_id,)).fetchone():
+                fail("当前 Profile 不在数据库中，已保留原配置")
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup = home / f".claude-switcher-backup-{stamp}-{secrets.token_hex(4)}.sqlite"
+            db.execute("VACUUM INTO ?", (str(backup),))
+        with sqlite3.connect(database, timeout=5) as db:
+            db.execute("PRAGMA busy_timeout=5000")
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                for action, content in [("DOMAIN_SUFFIX", value) for value in DOMAINS] + [("DST_PORT", str(value)) for value in PORTS]:
+                    exists = db.execute(
+                        "SELECT 1 FROM rules WHERE profile_id=? AND rule_action=? AND content=? AND rule_target=?",
+                        (profile_id, action, content, target),
+                    ).fetchone()
+                    if exists:
+                        continue
+                    while True:
+                        rule_id = secrets.randbits(62)
+                        if not db.execute("SELECT 1 FROM rules WHERE id=?", (rule_id,)).fetchone():
+                            break
+                    db.execute(
+                        'INSERT INTO rules (id, profile_id, rule_action, content, rule_target, rule_provider, sub_rule, no_resolve, src, "order") '
+                        "VALUES (?, ?, ?, ?, ?, NULL, NULL, 0, 0, NULL)",
+                        (rule_id, profile_id, action, content, target),
+                    )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+        print(f"BACKUP={backup}")
+    except SystemExit:
+        raise
+    except Exception as error:
+        if backup and backup.exists():
+            shutil.copyfile(backup, database)
+        fail(f"写入 FlClash 规则失败:{type(error).__name__}")
+
+
+def rollback(home, backup_name):
+    backup = Path(backup_name).resolve()
+    if backup.parent != home.resolve() or not backup.name.startswith(".claude-switcher-backup-") or backup.suffix != ".sqlite" or not backup.is_file():
+        fail("回滚备份无效")
+    database = home / "database.sqlite"
+    try:
+        for suffix in ("-wal", "-shm"):
+            (home / f"database.sqlite{suffix}").unlink(missing_ok=True)
+        shutil.copyfile(backup, database)
+        print("OK:已回滚 FlClash 配置")
+    except OSError as error:
+        fail(f"回滚失败:{type(error).__name__}")
+
+
+def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "repair":
+        repair(Path(sys.argv[2]), sys.argv[3])
+        return
+    if len(sys.argv) == 4 and sys.argv[1] == "rollback":
+        rollback(Path(sys.argv[2]), sys.argv[3])
+        return
+    fail("用法: flclash-repair repair <配置目录> <代理组> | rollback <配置目录> <备份>")
+
+
+if __name__ == "__main__":
+    main()
+PY_FLCLASH_REPAIR
+fi
+
 if [ "${1:-}" = "clash-rules" ]; then
     shift
     exec "${CLAUDE_SWITCHER_PYTHON:-python3}" - "$@" <<'PY_CLASH_RULES'
@@ -1291,8 +1456,68 @@ checkdetail() {
 # 保留隐藏入口供安装器调用;现在生成全局 Script.js 并迁移旧管理块。
 write_merge_rules() { clash_rules write; }
 
+flclash_repair() {
+    "${BASH:-/bin/bash}" "$0" flclash-repair "$@"
+}
+
+fix_flclash() {
+    local dir="$HOME/Library/Application Support/com.follow.clash"
+    local result backup trace ip wr i
+    [ -d "$dir" ] || { echo "FIX:FlClash 配置目录不存在，无法自动修复"; return 1; }
+    if pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1; then
+        osascript -e 'tell application "FlClash" to quit' >/dev/null 2>&1
+        for i in $(seq 1 15); do
+            pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1 || break
+            sleep 1
+        done
+    fi
+    if pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1; then
+        echo "FIX:FlClash 未能退出，请手动退出后重试"
+        return 1
+    fi
+    if ! result=$(flclash_repair repair "$dir" "$PROXY_GROUP" 2>&1); then
+        echo "$result"
+        echo "FIX:FlClash 未修改配置"
+        return 1
+    fi
+    backup=$(printf '%s\n' "$result" | sed -n 's/^BACKUP=//p' | head -1)
+    [ -n "$backup" ] || { echo "FIX:FlClash 未生成有效备份，已中止"; return 1; }
+    open -a "FlClash"
+    for i in $(seq 1 30); do
+        if proxy_alive && tun_up; then break; fi
+        sleep 1
+    done
+    sleep 2
+    if route_ok; then
+        trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+        ip=$(echo "$trace" | grep '^ip=' | cut -d= -f2)
+        wr=$(webrtc_status "$ip")
+        case "$wr" in
+            ok:*) echo "FIX:FlClash 域名与 STUN 规则已生效 ✓"; return 0 ;;
+            warn:*) echo "FIX:FlClash 规则已写入，但 STUN 状态未确认($wr)"; return 0 ;;
+        esac
+    fi
+    osascript -e 'tell application "FlClash" to quit' >/dev/null 2>&1
+    for i in $(seq 1 15); do
+        pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1 || break
+        sleep 1
+    done
+    local rollback_result
+    if ! rollback_result=$(flclash_repair rollback "$dir" "$backup" 2>&1); then
+        echo "$rollback_result"
+        echo "FIX:FlClash 回滚失败，请手动恢复备份 $backup"
+        return 1
+    fi
+    open -a "FlClash"
+    echo "FIX:FlClash 验证失败，已回滚；请检查 fake-IP、代理组及节点 UDP 支持"
+    return 1
+}
+
 # 一键修复:按项自动修复,每步输出结果
 fix() {
+    if [ "$PROXY_MODE" = "flclash" ]; then
+        fix_flclash || return 1
+    fi
     if [ "$PROXY_MODE" = "clash-verge" ]; then
         local policy_result
         if ! policy_result=$(clash_rules policy 2>&1); then
@@ -1414,7 +1639,7 @@ ASEOF
             return 1
         fi
         echo "FIX:置顶规则 ✓ 已验证内核实际加载"
-    elif ! route_ok; then
+    elif [ "$PROXY_MODE" != "flclash" ] && ! route_ok; then
         echo "FIX:置顶规则 ✗ 请在 $(proxy_name) 中自行添加 DOMAIN-SUFFIX 置顶规则"
     fi
 

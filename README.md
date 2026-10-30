@@ -295,8 +295,17 @@ Windows 加密快照使用 `.csnap`（PBKDF2-HMAC-SHA256 + AES-256-CBC + HMAC-SH
 
 - 换成 FlClash 后，「代理内核」与保镖识别 `FlClashCore`/`FlClash` 进程；WebRTC 与其他非 Clash Verge 客户端一致，STUN 无响应显示「未确认」，不会把未验证当作已安全拒绝
 - 换成 Shadowrocket 后，「代理内核」检查 `scutil --nc` 的连接状态，不再去找 Clash Verge
-- 非 Clash 客户端不做配置改写，「规则置顶」改用 fake-ip 行为检测；不通过时按提示在客户端里手动添加 Claude 域名规则
+- FlClash 可通过「一键修复」自动补齐当前 Profile 的 Claude 生态域名与 STUN UDP 端口规则；其他非 Clash 客户端仍需自行配置，「规则置顶」使用 fake-ip 行为检测
 - 「保镖」现在会核对运行中 LaunchDaemon 与 root 所有的保镖脚本内 `MODE`，不再只看进程是否存在；客户端模式不一致时显示 `fail:客户端不一致`，此时需手动重跑 `installer/安装.command` 同步保镖（需要管理员权限）。`fix` 只能启动缺失的 LaunchDaemon，**不会更新已有 root 脚本内的旧模式**；在重新检查通过前不要启动 Claude。
+
+### FlClash 一键修复
+
+当 FlClash 出现 DNS 未走隧道、Claude 域名未置顶或 STUN 暴露非代理出口时，「一键修复」会关闭 FlClash，备份 `database.sqlite`，在当前 Profile 中事务写入 Claude 生态域名及 UDP `3478 / 5349 / 19302` 规则，再重启并验证 fake-IP 路由和 STUN 结果。重复执行不会插入重复规则。
+
+- 只修改当前 Profile，使用当前配置中有效的代理组；不读取或输出订阅、节点和凭据内容
+- 要求已启用 fake-IP；无法识别当前 Profile、数据库结构不支持或代理组无效时不会写入
+- 验证失败会回滚数据库并保留备份，STUN 无响应仍标为未确认，不伪装成通过
+- 默认保留 WebRTC 能力，节点必须支持 UDP；不要为通过检查而关闭 DNS 或 WebRTC 检查
 
 ## 账号快照加密导出（macOS）
 

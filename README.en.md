@@ -30,7 +30,7 @@ closing the window in which traffic could leave outside the proxy.
 - **Snapshot switching** — archives and restores whole account directories; APFS copy-on-write cloning avoids duplicating unchanged data.
 - **Fail-closed bodyguard** — checks the proxy kernel and virtual interface every ten seconds and terminates protected processes when the tunnel is lost.
 - **Drift watchdog** — records a baseline for time zone and proxy settings and rolls back silent changes made by other software.
-- **Multiple proxy clients** — detects Clash Verge, Shadowrocket, sing-box, ClashX, and Surge, with an automatic mode; non-Clash clients keep their own configuration.
+- **Multiple proxy clients** — detects Clash Verge, FlClash, Shadowrocket, sing-box, ClashX, and Surge, with an automatic mode. Clash Verge and FlClash repairs install and verify routing rules with rollback; other non-Clash clients keep their own configuration.
 - **Region adaptation** — captures the exit country, time zone, and locale at install time and re-locks all three after moving to a different node.
 - **Pinned routing** — places Claude domains and supporting services above third-party rule sets.
 - **WebRTC leak probe** — a standard-library STUN client that compares global and local vantage points to distinguish a proxied path from a direct one.
