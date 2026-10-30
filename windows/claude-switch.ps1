@@ -1944,7 +1944,9 @@ function Read-SnapshotPassword([string]$Mode, [string]$Prompt = '输入快照密
 function Get-SnapshotKeys([string]$Password, [byte[]]$Salt) {
     $passwordBytes = [System.Text.Encoding]::UTF8.GetBytes($Password)
     try {
-        $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes -ArgumentList $passwordBytes,$Salt,200000,[System.Security.Cryptography.HashAlgorithmName]::SHA256
+        # 必须用 ::new()：New-Object -ArgumentList 会把 HashAlgorithmName 结构体转成字符串，
+        # Rfc2898DeriveBytes 随即抛 "is not a known hash algorithm"（Windows PowerShell 5.1 实测）
+        $kdf = [System.Security.Cryptography.Rfc2898DeriveBytes]::new($passwordBytes, $Salt, 200000, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
         try { $material = $kdf.GetBytes(64) } finally { $kdf.Dispose() }
         $encryptionKey = New-Object byte[] 32
         $macKey = New-Object byte[] 32
@@ -2086,6 +2088,32 @@ function Expand-SnapshotArchive([string]$ZipPath, [string]$Destination) {
     [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $Destination)
 }
 
+# .NET Framework 的 ZipFile::CreateFromDirectory 用 '\' 写条目名，会被 Test-SnapshotArchive
+# 的路径校验判为「非法路径」；这里手工写条目，统一成 '/'（.NET Core 才默认 '/')
+function New-SnapshotArchive([string]$SourceDir, [string]$ZipPath) {
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $root = [System.IO.Path]::GetFullPath($SourceDir).TrimEnd('\', '/')
+    $stream = [System.IO.File]::Open($ZipPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        $zip = New-Object System.IO.Compression.ZipArchive($stream, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($dir in @(Get-ChildItem -LiteralPath $root -Recurse -Directory -Force -ErrorAction SilentlyContinue)) {
+                [void]$zip.CreateEntry($dir.FullName.Substring($root.Length + 1).Replace('\', '/') + '/')
+            }
+            foreach ($file in @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+                $entry = $zip.CreateEntry($file.FullName.Substring($root.Length + 1).Replace('\', '/'), [System.IO.Compression.CompressionLevel]::Optimal)
+                $entry.ExternalAttributes = [int]$file.Attributes
+                $entryStream = $entry.Open()
+                try {
+                    $fileStream = [System.IO.File]::OpenRead($file.FullName)
+                    try { $fileStream.CopyTo($entryStream) } finally { $fileStream.Dispose() }
+                } finally { $entryStream.Dispose() }
+            }
+        } finally { $zip.Dispose() }
+    } finally { $stream.Dispose() }
+}
+
 function Export-EncryptedSnapshot([string]$Target, [string]$Out, [string]$Mode) {
     if (-not (Test-AccountSlot $Target)) { $script:exitCode = 1; 'FAIL:账号必须是 A、B、C 或 D'; return }
     $source = Join-Path $BASE "accounts\$Target"
@@ -2109,7 +2137,7 @@ function Export-EncryptedSnapshot([string]$Target, [string]$Out, [string]$Mode) 
         $meta = [ordered]@{ format = 'claude-switcher-snapshot'; version = 1; account = $Target; created = ([DateTime]::UtcNow.ToString('o')); platform = 'Windows' }
         [System.IO.File]::WriteAllText((Join-Path $stage '.claude-switcher-snapshot.json'), ($meta | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
         Add-Type -AssemblyName System.IO.Compression.FileSystem
-        [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $plain, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+        New-SnapshotArchive $stage $plain
         Protect-SnapshotFile $plain $Out $password
         "OK:账号$Target 已加密导出到 $Out"
     } catch {

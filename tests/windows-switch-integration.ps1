@@ -34,7 +34,8 @@ function global:Start-Process {
 $script:failOldCleanup = $false
 function global:Remove-Item {
     [CmdletBinding()]
-    param([string]$LiteralPath, [switch]$Recurse, [switch]$Force, [string]$ErrorAction)
+    # -ErrorAction 由 [CmdletBinding()] 提供，param 里不能再声明一次（否则调用时报参数重复定义）
+    param([string]$LiteralPath, [switch]$Recurse, [switch]$Force)
     if ($script:failOldCleanup -and $LiteralPath -eq "$BASE\staging\Claude.old") { throw 'simulated locked recovery directory' }
     Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters
 }
@@ -113,7 +114,8 @@ try {
     Assert 'keep 路径仍归档在原账号' ((Read-Text "$accounts\A\settings.json") -eq 'shared-A')
     Assert 'keep 暂存成功后清理' (-not (Test-Path -LiteralPath "$base\keep-stage"))
     $status = (@(Invoke-Status) -join "`n")
-    Assert '状态包含 C/D 与账号列表' ($status -match 'hasC=1 hasD=0' -and $status -match 'accounts=A,B')
+    # 空槽位不落盘：切到 C 后 current=C，但 accounts\C 只有真正有数据时才出现
+    Assert '状态包含 C/D 与账号列表' ($status -match 'hasC=0 hasD=0' -and $status -match 'accounts=A,B') "输出=$status"
 
     # 8. 清理失败：数据和指针仍提交到目标账号，归属明确的残留下次可清理
     $script:failOldCleanup = $true
