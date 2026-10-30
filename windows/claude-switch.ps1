@@ -12,7 +12,21 @@ $PROXY_GROUP = "GLOBAL"                # Clash 代理组名
 # =======================================================
 
 $BASE = Join-Path $env:USERPROFILE ".claude-switcher"
-$DATA = Join-Path $env:APPDATA "Claude"
+function Find-ClaudeDataPath {
+    $legacy = Join-Path $env:APPDATA "Claude"
+    if (Test-Path -LiteralPath $legacy) { return $legacy }
+    $msixRoot = Join-Path $env:LOCALAPPDATA "Claude-Data"
+    try {
+        $pkg = Get-AppxPackage -Name 'Claude' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($pkg -and $pkg.PackageFamilyName) {
+            return (Join-Path $msixRoot ([string]$pkg.PackageFamilyName))
+        }
+    } catch {}
+    $candidates = @(Get-ChildItem -LiteralPath $msixRoot -Directory -Filter 'claude_*' -ErrorAction SilentlyContinue)
+    if ($candidates.Count -eq 1) { return $candidates[0].FullName }
+    return $legacy
+}
+$DATA = Find-ClaudeDataPath
 $LOG  = Join-Path $BASE "claude-switch.log"
 $CLIENT_LOG = Join-Path $BASE "logs\client.log"
 $CHECK_CONFIG = Join-Path $BASE "checks.json"

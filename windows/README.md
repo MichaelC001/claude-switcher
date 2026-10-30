@@ -12,7 +12,7 @@
   - **sing-box / ClashX / Surge / WireGuard** —— 按进程或服务识别
   - **其他 TUN 客户端**（Astrill / OpenVPN / Tailscale 等）—— 安装时选 `other`
   - **auto** —— 任一已知进程/服务命中即视为在线（未识别到客户端时的默认选项）
-- Claude 桌面版 Windows
+- Claude 桌面版 Windows（传统 EXE 或 MSIX/Appx；MSIX 数据目录可自动发现，但仍待 Windows 真机验收）
 - 安装时需要**管理员权限**一次（注册守护任务 / 锁定时区 / 关闭 IPv6）
 
 > 代理模式同时写入 `%USERPROFILE%\.claude-switcher\proxy-mode.txt`，保镖按这个文件分派检测逻辑；缺失时按旧版 Clash Verge 行为处理。
@@ -124,7 +124,7 @@ claude-switch.ps1 set-check-config '{"disabled":["DNS"],"allowOptionalFailures":
 
 同盘安装时，切换暂存和旧目录备份位于 `%USERPROFILE%\.claude-switcher\staging`，不会在 `%APPDATA%` 产生额外的 `Claude.new` / `Claude.old`。数据与账号指针先提交，再清理旧目录；清理失败不会把指针留在旧账号。下次切换只重试清理 `cleanup.json` 能证明归属的残留，不明目录仍需人工确认，绝不自动删除。若 `%APPDATA%` 与 `%USERPROFILE%` 在不同卷，为避免跨卷改名失败，仍使用原 `Claude.new` / `Claude.old` 路径。
 
-跨身份保留默认关闭。在 `%USERPROFILE%\.claude-switcher\keep-in-workspace.txt` 中每行写一个相对 `%APPDATA%\Claude` 的路径（如 `settings.json`、`skills/`），切换时先暂存，再合并到目标账号。绝对路径、盘符路径、`..` 越界和重解析点会跳过；暂存或还原失败会阻止启动，已有 `keep-stage` 不会被覆盖。只共享通用配置，不要放登录态、Cookie、缓存或账号专属数据。
+跨身份保留默认关闭。在 `%USERPROFILE%\.claude-switcher\keep-in-workspace.txt` 中每行写一个相对当前 Claude 数据目录的路径（如 `settings.json`、`skills/`），切换时先暂存，再合并到目标账号。绝对路径、盘符路径、`..` 越界和重解析点会跳过；暂存或还原失败会阻止启动，已有 `keep-stage` 不会被覆盖。只共享通用配置，不要放登录态、Cookie、缓存或账号专属数据。
 
 ## 维护工具
 
@@ -168,7 +168,7 @@ claude-switch.ps1 diagnose-proxy --config <私有配置.json>
 | 保镖判定 | 显式客户端模式按「客户端进程/服务 + TUN」；`auto` / `other` 只查 TUN |
 | IPv6 | 关闭的是所有网卡的 ms_tcpip6 绑定;要恢复: `Enable-NetAdapterBinding -ComponentID ms_tcpip6` |
 | SmartScreen | 首次运行可能弹"Windows 已保护你的电脑" → 点「更多信息」→「仍要运行」 |
-| 账号数据目录 | Windows 版在 `%APPDATA%\Claude`(与 macOS 路径不同,逻辑相同) |
+| 账号数据目录 | 传统 EXE 版为 `%APPDATA%\Claude`；MSIX/Appx 为 `%LOCALAPPDATA%\Claude-Data\<PackageFamilyName>`，旧版目录不存在时自动发现 |
 | 卸载 | 计划任务里删掉 ClaudeBodyguard,删除 `%USERPROFILE%\.claude-switcher` 和桌面快捷方式即可 |
 
 ## 已知限制与验证范围
