@@ -43,7 +43,7 @@ class SetClientTests(unittest.TestCase):
         return ""
 
     def test_switches_mode(self):
-        for mode in ("shadowrocket", "sing-box", "flclash", "bettbox", "auto", "clash-verge"):
+        for mode in ("shadowrocket", "sing-box", "flclash", "clash-party", "bettbox", "auto", "clash-verge"):
             result = self.run_set(mode)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(self.current_mode(), mode)
@@ -203,6 +203,34 @@ class SetClientTests(unittest.TestCase):
         install = (ROOT / "installer" / "安装.command").read_text(encoding="utf-8")
         self.assertIn("bettbox", install)
         self.assertIn("/Applications/Bettbox.app", install)
+
+    def test_clash_party_sidecar_keeps_guard_online_and_ignores_root_helper(self):
+        script = self.install_guard("clash-party")
+        self.stub("ifconfig", "#!/bin/sh\necho 'inet 198.18.0.1'\n")
+        self.stub("pgrep", "#!/bin/sh\ncase \"$*\" in */Contents/Resources/sidecar/mihomo*|*Claude.app*) exit 0 ;; *) exit 1 ;; esac\n")
+        self.stub("pkill", "#!/bin/sh\ntouch \"$CLAUDE_SWITCHER_TEST_ROOT/pkill-called\"\n")
+        self.stub("id", "#!/bin/sh\necho 502\n")
+        self.stub("ps", "#!/bin/sh\ncat <<'EOF'\n  301   502 node            /Users/u/project/server.js\nEOF\n")
+        run = self.run_guard(script)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertFalse((self.root / "pkill-called").exists(),
+                         "Clash Party sidecar mihomo 在线时保镖不得误杀 Claude")
+
+        # 退出客户端后常驻 party.mihomo.helper 仍在,保镖不得误判内核在线
+        self.stub("ifconfig", "#!/bin/sh\necho 'inet 198.18.0.1'\n")
+        self.stub("pgrep", "#!/bin/sh\ncase \"$*\" in *party.mihomo.helper*|*Claude.app*) exit 0 ;; *) exit 1 ;; esac\n")
+        run2 = self.run_guard(script)
+        self.assertEqual(run2.returncode, 0, run2.stdout + run2.stderr)
+        self.assertTrue((self.root / "pkill-called").exists(),
+                        "仅剩 party.mihomo.helper 时保镖必须判定离线并关闭 Claude")
+
+    def test_installer_and_ui_offer_clash_party(self):
+        install = (ROOT / "installer" / "安装.command").read_text(encoding="utf-8")
+        self.assertIn("clash-party", install)
+        self.assertIn("Library/Application Support/mihomo-party", install)
+        self.assertIn("/Applications/Clash Party.app", install)
+        swift = (ROOT / "app" / "main.swift").read_text(encoding="utf-8")
+        self.assertIn('("clash-party", "Clash Party")', swift)
 
     def test_bodyguard_offline_still_kills_desktop_claude(self):
         script = self.install_guard("clash-verge")

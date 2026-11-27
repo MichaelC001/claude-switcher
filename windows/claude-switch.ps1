@@ -347,7 +347,7 @@ function Get-ProxyName {
 # 代理客户端在线判定:按安装时识别的客户端分派;auto 任一命中即活,other 只依赖 TUN
 function Test-ProxyAlive {
     switch ($PROXY_MODE) {
-        'clash-verge' { return [bool](Get-Process -Name 'verge-mihomo' -ErrorAction SilentlyContinue) }
+        'clash-verge' { return [bool](Get-Process -Name 'verge-mihomo*' -ErrorAction SilentlyContinue) }
         'flclash'     { return [bool](Get-Process -Name 'FlClashCore','FlClash' -ErrorAction SilentlyContinue) }
         'sing-box'    { return [bool](Get-Process -Name 'sing-box' -ErrorAction SilentlyContinue) }
         'clashx'      { return [bool](Get-Process -Name 'ClashX' -ErrorAction SilentlyContinue) }
@@ -355,11 +355,62 @@ function Test-ProxyAlive {
         'wireguard'   { return [bool](Get-Service -Name 'WireGuardTunnel*' -ErrorAction SilentlyContinue | Where-Object Status -eq 'Running') }
         'other'       { return $true }
         'auto' {
-            if (Get-Process -Name 'verge-mihomo','FlClashCore','FlClash','sing-box','ClashX','Surge' -ErrorAction SilentlyContinue) { return $true }
+            if (Get-Process -Name 'verge-mihomo*','FlClashCore','FlClash','sing-box','ClashX','Surge' -ErrorAction SilentlyContinue) { return $true }
             return [bool](Get-Service -Name 'WireGuardTunnel*' -ErrorAction SilentlyContinue | Where-Object Status -eq 'Running')
         }
-        default { return [bool](Get-Process -Name 'verge-mihomo' -ErrorAction SilentlyContinue) }
+        default { return [bool](Get-Process -Name 'verge-mihomo*' -ErrorAction SilentlyContinue) }
     }
+}
+
+# 保镖计划任务设置审计:检查是否已解除默认 72 小时超时与电池停机限制
+function Test-BodyguardTaskHardened($Task) {
+    if ($null -eq $Task -or $null -eq $Task.Settings) { return $false }
+    $s = $Task.Settings
+    if ([bool]$s.DisallowStartIfOnBatteries -or [bool]$s.StopIfGoingOnBatteries) { return $false }
+    $limit = if ($null -ne $s.ExecutionTimeLimit) { ([string]$s.ExecutionTimeLimit).Trim() } else { '' }
+    if ($limit -notin @('', 'PT0S', 'P0D', '00:00:00')) { return $false }
+    return $true
+}
+
+function Test-BodyguardProcessAlive {
+    try {
+        $procs = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction SilentlyContinue
+        foreach ($p in $procs) {
+            if ($p.ProcessId -eq $PID) { continue }
+            if ([string]$p.CommandLine -match 'claude-bodyguard\.ps1') { return $true }
+        }
+    } catch {}
+    return $false
+}
+
+# 保镖存活判定:管理员注册的计划任务在普通权限下可能无法读取进程命令行,
+# 因此计划任务处于 Running 或进程命令行命中任一成立即视为在跑;被 72h/电池终止后 State 会落回 Ready。
+function Test-BodyguardAlive($Task = $null) {
+    if ($null -eq $Task) {
+        $Task = Get-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue
+    }
+    if ($null -ne $Task -and ([string]$Task.State -eq 'Running')) { return $true }
+    return (Test-BodyguardProcessAlive)
+}
+
+function Get-BodyguardStatus {
+    $bg = Get-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue
+    if ($null -eq $bg) { return '保镖=fail:未安装' }
+    $alive = Test-BodyguardAlive $bg
+    $hardened = Test-BodyguardTaskHardened $bg
+    if (-not $alive) {
+        if ([string]$bg.State -eq 'Disabled') {
+            return '保镖=fail:计划任务已禁用(请点一键修复)'
+        }
+        if (-not $hardened) {
+            return '保镖=fail:未运行(计划任务含72h/电池限制,请点一键修复)'
+        }
+        return '保镖=fail:未运行(请点一键修复重新启动)'
+    }
+    if (-not $hardened) {
+        return '保镖=warn:运行中,但计划任务含72h或电池限制(建议点一键修复加固)'
+    }
+    return '保镖=ok:运行中'
 }
 
 function Get-Client {
@@ -1620,8 +1671,7 @@ function Invoke-CheckDetail {
         Format-OptionalResult 'WebRTC' ([string]$w.code) ([string]$w.detail)
     }
 
-    $bg = Get-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue
-    if ($bg) { "保镖=ok" } else { "保镖=fail:未安装" }
+    Get-BodyguardStatus
 
     Get-RulesStatus
 
@@ -1821,8 +1871,22 @@ function Invoke-Fix {
     if ((Get-TimeZone).Id -ne $TZ_TARGET) { $adminScript += "Set-TimeZone -Id '$TZ_TARGET'" }
     if (Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled }) { $adminScript += "Get-NetAdapterBinding -ComponentID ms_tcpip6 | Disable-NetAdapterBinding -Confirm:`$false" }
     $adminScript += "Clear-DnsClientCache"
-    if (-not (Get-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue)) {
-        $adminScript += "`$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$BASE\claude-bodyguard.ps1`"'; `$t = New-ScheduledTaskTrigger -AtLogOn; Register-ScheduledTask -TaskName 'ClaudeBodyguard' -Action `$a -Trigger `$t -Force | Out-Null; Start-ScheduledTask -TaskName 'ClaudeBodyguard'"
+    $bgTask = Get-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue
+    $bgNeedRegister = ($null -eq $bgTask) -or ([string]$bgTask.State -eq 'Disabled') -or (-not (Test-BodyguardTaskHardened $bgTask))
+    $bgAlive = Test-BodyguardAlive $bgTask
+    if (-not $bgNeedRegister -and -not $bgAlive) {
+        try {
+            Start-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction Stop
+            Start-Sleep -Milliseconds 300
+            $bgTask = Get-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue
+            $bgAlive = Test-BodyguardAlive $bgTask
+        } catch {}
+    }
+    if ($bgNeedRegister) {
+        $bgEsc = $BASE.Replace("'", "''")
+        $adminScript += "`$bgPath = '$bgEsc\claude-bodyguard.ps1'; `$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"' + `$bgPath + '`"'); `$t = New-ScheduledTaskTrigger -AtLogOn; `$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew; Register-ScheduledTask -TaskName 'ClaudeBodyguard' -Action `$a -Trigger `$t -Settings `$s -Force | Out-Null; Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName 'ClaudeBodyguard'"
+    } elseif (-not $bgAlive) {
+        $adminScript += "Start-ScheduledTask -TaskName 'ClaudeBodyguard'"
     }
     if ($adminScript.Count -gt 0) {
         "FIX:修复时区/IPv6/DNS/保镖(需要管理员授权)..."

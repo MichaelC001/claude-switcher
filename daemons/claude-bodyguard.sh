@@ -23,6 +23,14 @@ clashx_alive() {
         || pgrep -x 'ClashX Meta' >/dev/null 2>&1
 }
 
+# Clash Party(原 Mihomo Party)通过 Contents/Resources/sidecar/mihomo* 拉起内核;
+# 不匹配常驻 root helper party.mihomo.helper,避免退出客户端后误判在线。
+clash_party_alive() {
+    pgrep -f '/Contents/Resources/sidecar/mihomo' >/dev/null 2>&1 \
+        || pgrep -f '/tmp/mihomo-party-.*\.sock' >/dev/null 2>&1 \
+        || pgrep -f '/Application Support/mihomo-party/work' >/dev/null 2>&1
+}
+
 # TUN 在线判定:存在 fake-ip 网段地址即视为 TUN 已接管
 ifconfig 2>/dev/null | grep -q 'inet 198\.18\.' || ok=0
 
@@ -30,6 +38,8 @@ ifconfig 2>/dev/null | grep -q 'inet 198\.18\.' || ok=0
 case "$MODE" in
     clash-verge)
         pgrep -f verge-mihomo >/dev/null 2>&1 || ok=0 ;;
+    clash-party)
+        clash_party_alive || ok=0 ;;
     flclash)
         { pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1; } || ok=0 ;;
     bettbox)

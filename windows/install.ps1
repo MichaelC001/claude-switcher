@@ -317,13 +317,14 @@ Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Whe
 Clear-DnsClientCache
 Write-Host "[OK] 时区已锁定 / IPv6 已关闭 / DNS 缓存已刷新" -ForegroundColor Green
 
-# ---- 8. 注册保镖计划任务 ----
-$action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$BASE\claude-bodyguard.ps1`""
-$trigger = New-ScheduledTaskTrigger -AtLogOn
-Register-ScheduledTask -TaskName 'ClaudeBodyguard' -Action $action -Trigger $trigger -Force | Out-Null
+# ---- 8. 注册保镖计划任务(禁用默认72小时超时与电池停机限制,异常退出自动拉起) ----
+$action   = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$BASE\claude-bodyguard.ps1`""
+$trigger  = New-ScheduledTaskTrigger -AtLogOn
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName 'ClaudeBodyguard' -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
 Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue
 Start-ScheduledTask -TaskName 'ClaudeBodyguard'
-Write-Host "[OK] 保镖已注册并启动(计划任务,登录自动运行)" -ForegroundColor Green
+Write-Host "[OK] 保镖已注册并启动(计划任务,登录自动运行,无时长/电池限制)" -ForegroundColor Green
 
 # ---- 9. 重启 Clash 使规则生效(仅 Clash Verge) ----
 if ($PROXY_MODE -eq 'clash-verge') {

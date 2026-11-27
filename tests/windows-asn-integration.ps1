@@ -92,4 +92,8 @@ if ($LASTEXITCODE -ne 0) { throw "检查结果文件回归失败: $LASTEXITCODE"
 $ipReputationTest = Join-Path $PSScriptRoot 'windows-ip-reputation-integration.ps1'
 & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $ipReputationTest
 if ($LASTEXITCODE -ne 0) { throw "IP 信誉回归失败: $LASTEXITCODE" }
+
+$bodyguardTest = Join-Path $PSScriptRoot 'windows-bodyguard-integration.ps1'
+& (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $bodyguardTest
+if ($LASTEXITCODE -ne 0) { throw "保镖存活与计划任务加固回归失败: $LASTEXITCODE" }
 'ALL PASS'

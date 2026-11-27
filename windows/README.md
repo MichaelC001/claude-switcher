@@ -50,7 +50,7 @@ Windows 版启动时会静默检查 GitHub 最新 Release，有新版本时在�
 
 | 客户端 | `$PROXY_MODE` | 存活判定 | 说明 |
 |---|---|---|---|
-| Clash Verge | `clash-verge` | `verge-mihomo` 进程 + TUN | 按 Clash 模式自动配置规则（全局/直连跳过） |
+| Clash Verge | `clash-verge` | `verge-mihomo*` 进程 + TUN | 按 Clash 模式自动配置规则（全局/直连跳过） |
 | FlClash | `flclash` | `FlClashCore` / `FlClash` 进程 + TUN | 内核审查读取 `%APPDATA%\com.follow\clash\config.yaml` 的 `external-controller`；没有该地址时再探测 `127.0.0.1:9090` 和该进程自己的本机监听口。主窗口可填写本机端口，保存在 `flclash-controller.txt`。置顶规则仍需自行配置 |
 | sing-box | `sing-box` | `sing-box` 进程 + TUN | 置顶规则需自行配置 |
 | ClashX | `clashx` | `ClashX` 进程 + TUN | 置顶规则需自行配置 |
@@ -230,8 +230,8 @@ claude-switch.ps1 diagnose-proxy --config <私有配置.json>
 | 项目 | 说明 |
 |---|---|
 | 时区名称 | Windows 用 `Eastern Standard Time` 这类 ID,安装器会自动把 IP 城市映射过去 |
-| 保镖频率 | 计划任务登录启动,隐藏窗口常驻,每 10 秒巡检(与 Mac 一致) |
-| 保镖判定 | 显式客户端模式按「客户端进程/服务 + TUN」；`auto` / `other` 只查 TUN |
+| 保镖频率 | 计划任务登录启动,隐藏窗口常驻,每 3 秒巡检(解除默认 72 小时超时与电池停机限制,异常退出自动拉起) |
+| 保镖判定 | 审计校验计划任务存活或保镖进程在跑；显式客户端模式按「客户端进程/服务 + TUN」,`auto` / `other` 只查 TUN |
 | IPv6 | 关闭的是所有网卡的 ms_tcpip6 绑定;要恢复: `Enable-NetAdapterBinding -ComponentID ms_tcpip6` |
 | SmartScreen | 首次运行可能弹"Windows 已保护你的电脑" → 点「更多信息」→「仍要运行」 |
 | 账号数据目录 | 传统 EXE 版为 `%APPDATA%\Claude`；MSIX/Appx 为 `%LOCALAPPDATA%\Claude-Data\<PackageFamilyName>`，旧版目录不存在时自动发现 |

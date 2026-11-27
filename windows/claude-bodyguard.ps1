@@ -25,7 +25,7 @@ function Get-TunStatus {
 # 客户端进程/服务在线判定:auto 与 other 只依赖 TUN,不要求特定进程(避免误杀)
 function Test-ClientAlive {
     switch ($PROXY_MODE) {
-        'clash-verge' { return [bool](Get-Process -Name 'verge-mihomo' -ErrorAction SilentlyContinue) }
+        'clash-verge' { return [bool](Get-Process -Name 'verge-mihomo*' -ErrorAction SilentlyContinue) }
         'flclash'     { return [bool](Get-Process -Name 'FlClashCore','FlClash' -ErrorAction SilentlyContinue) }
         'sing-box'    { return [bool](Get-Process -Name 'sing-box' -ErrorAction SilentlyContinue) }
         'clashx'      { return [bool](Get-Process -Name 'ClashX' -ErrorAction SilentlyContinue) }
@@ -33,7 +33,7 @@ function Test-ClientAlive {
         'wireguard'   { return [bool](Get-Service -Name 'WireGuardTunnel*' -ErrorAction SilentlyContinue | Where-Object Status -eq 'Running') }
         'auto'        { return $true }
         'other'       { return $true }
-        default       { return [bool](Get-Process -Name 'verge-mihomo' -ErrorAction SilentlyContinue) }
+        default       { return [bool](Get-Process -Name 'verge-mihomo*' -ErrorAction SilentlyContinue) }
     }
 }
 
@@ -61,5 +61,5 @@ while ($true) {
     } else {
         $offline = $false
     }
-    Start-Sleep -Seconds 10
+    Start-Sleep -Seconds 3
 }

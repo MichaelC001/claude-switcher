@@ -140,11 +140,94 @@ locale_for() {
     esac
 }
 
+# 识别常见有线/无线主网络服务(与 core/claude-switch.sh 保持一致,排除桥接/蓝牙/移动热点等伪服务)
+_ipv6_is_lan_wlan_service() {
+    case "$1" in
+        *"Thunderbolt Bridge"*|*"Bluetooth"*|*"FireWire"*|*"iPhone"*|*"iPad"*) return 1 ;;
+        *Wi-Fi*|*AirPort*|*Ethernet*|*LAN*|*"以太网"*|*"局域网"*|*"无线局域网"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 扫描 macOS 网络服务的 IPv6 状态:优先当前活跃连接,离线时回退已启用的以太网/Wi-Fi 服务
+_ipv6_scan() {
+    _IPV6_SCAN_STATE=""
+    _IPV6_OPEN_SERVICES=()
+    local raw_list line info v6_line ip4 router4 ip6 is_active is_off joined s
+    local active_all=() active_on=() active_off=()
+    local fallback_all=() fallback_on=() fallback_off=()
+    local chosen_on=() chosen_off=()
+    raw_list=$(networksetup -listallnetworkservices 2>/dev/null || true)
+    if printf '%s\n' "$raw_list" | grep -qi '^IPv6:'; then
+        if printf '%s\n' "$raw_list" | grep -qi '^IPv6:[[:space:]]*off'; then
+            _IPV6_SCAN_STATE="ok:已关闭"
+            return 0
+        fi
+        _IPV6_SCAN_STATE="fail:未关闭"
+        _IPV6_OPEN_SERVICES=("Wi-Fi")
+        return 0
+    fi
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        case "$line" in
+            ''|'An asterisk ('*|'*'*|'** Error:'*) continue ;;
+        esac
+        info=$(networksetup -getinfo "$line" 2>/dev/null || true)
+        v6_line=$(printf '%s\n' "$info" | grep -i '^IPv6:' | head -n 1)
+        [ -n "$v6_line" ] || continue
+        ip4=$(printf '%s\n' "$info" | sed -n 's/^IP address:[[:space:]]*//p' | head -n 1)
+        router4=$(printf '%s\n' "$info" | sed -n 's/^Router:[[:space:]]*//p' | head -n 1)
+        ip6=$(printf '%s\n' "$info" | sed -n 's/^IPv6 IP address:[[:space:]]*//p' | head -n 1)
+        is_active=0; is_off=0
+        if { [ -n "$ip4" ] && [ "$ip4" != "none" ] && [ "$ip4" != "(null)" ]; } \
+            || { [ -n "$router4" ] && [ "$router4" != "none" ] && [ "$router4" != "(null)" ]; } \
+            || { [ -n "$ip6" ] && [ "$ip6" != "none" ] && [ "$ip6" != "(null)" ]; }; then
+            is_active=1
+        fi
+        if printf '%s\n' "$v6_line" | grep -qi '^IPv6:[[:space:]]*off'; then
+            is_off=1
+        fi
+        if [ "$is_active" -eq 1 ]; then
+            active_all+=("$line")
+            if [ "$is_off" -eq 1 ]; then active_off+=("$line"); else active_on+=("$line"); fi
+        fi
+        if _ipv6_is_lan_wlan_service "$line"; then
+            fallback_all+=("$line")
+            if [ "$is_off" -eq 1 ]; then fallback_off+=("$line"); else fallback_on+=("$line"); fi
+        fi
+    done <<< "$raw_list"
+
+    if [ "${#active_all[@]}" -gt 0 ]; then
+        [ "${#active_on[@]}" -gt 0 ] && chosen_on=("${active_on[@]}")
+        [ "${#active_off[@]}" -gt 0 ] && chosen_off=("${active_off[@]}")
+    elif [ "${#fallback_all[@]}" -gt 0 ]; then
+        [ "${#fallback_on[@]}" -gt 0 ] && chosen_on=("${fallback_on[@]}")
+        [ "${#fallback_off[@]}" -gt 0 ] && chosen_off=("${fallback_off[@]}")
+    else
+        _IPV6_SCAN_STATE="fail:无法判断(未识别到网络服务)"
+        return 1
+    fi
+
+    joined=""
+    if [ "${#chosen_on[@]}" -gt 0 ]; then
+        _IPV6_OPEN_SERVICES=("${chosen_on[@]}")
+        for s in "${chosen_on[@]}"; do joined="${joined:+$joined, }$s"; done
+        _IPV6_SCAN_STATE="fail:未关闭($joined)"
+        return 0
+    fi
+    for s in "${chosen_off[@]}"; do joined="${joined:+$joined, }$s"; done
+    _IPV6_SCAN_STATE="ok:已关闭($joined)"
+    return 0
+}
+
 # ---- 0. 前置检查 ----
 CLASH_DIR="$H/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
+CLASH_PARTY_DIR="$H/Library/Application Support/mihomo-party"
 FLCLASH_DIR="$H/Library/Application Support/com.follow.clash"
 if [ -d "$CLASH_DIR" ]; then
     MODE="clash-verge"
+elif [ -d "$CLASH_PARTY_DIR" ] || [ -d "/Applications/Clash Party.app" ] || [ -d "/Applications/Mihomo Party.app" ]; then
+    MODE="clash-party"
 elif [ -d "$FLCLASH_DIR" ]; then
     MODE="flclash"
 elif [ -d "/Applications/Bettbox.app" ]; then
@@ -153,19 +236,20 @@ elif scutil --nc list 2>/dev/null | grep -q 'com.liguangming.Shadowrocket'; then
     MODE="shadowrocket"
 else
     echo "未自动识别到代理客户端,请手动选择:"
-    echo "  1) clash-verge    2) flclash         3) shadowrocket"
-    echo "  4) sing-box       5) clashx          6) surge"
-    echo "  7) bettbox        8) auto(任一命中即活)"
+    echo "  1) clash-verge    2) clash-party     3) flclash"
+    echo "  4) shadowrocket   5) sing-box        6) clashx"
+    echo "  7) surge          8) bettbox         9) auto(任一命中即活)"
     read -r -p "请输入序号或名称: " pick
     case "$pick" in
         1|clash-verge)  MODE="clash-verge" ;;
-        2|flclash)      MODE="flclash" ;;
-        3|shadowrocket)  MODE="shadowrocket" ;;
-        4|sing-box)      MODE="sing-box" ;;
-        5|clashx)        MODE="clashx" ;;
-        6|surge)         MODE="surge" ;;
-        7|bettbox)       MODE="bettbox" ;;
-        8|auto)          MODE="auto" ;;
+        2|clash-party)  MODE="clash-party" ;;
+        3|flclash)      MODE="flclash" ;;
+        4|shadowrocket) MODE="shadowrocket" ;;
+        5|sing-box)     MODE="sing-box" ;;
+        6|clashx)       MODE="clashx" ;;
+        7|surge)        MODE="surge" ;;
+        8|bettbox)      MODE="bettbox" ;;
+        9|auto)         MODE="auto" ;;
         *) echo "未识别的选择,退出"; exit 1 ;;
     esac
 fi
@@ -397,8 +481,16 @@ else
         launchctl bootout system/local.claude-update 2>/dev/null; rm -f /Library/LaunchDaemons/local.claude-update.plist;"
     curt=$(readlink /etc/localtime 2>/dev/null)
     [ "$curt" != "/var/db/timezone/zoneinfo/$TZV" ] && SYSCMDS="$SYSCMDS /usr/sbin/systemsetup -settimezone '$TZV';"
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
-    echo "$v6" | grep -qi 'off' || SYSCMDS="$SYSCMDS networksetup -setv6off Wi-Fi;"
+    if _ipv6_scan; then
+        if [ "${#_IPV6_OPEN_SERVICES[@]}" -gt 0 ]; then
+            for _svc in "${_IPV6_OPEN_SERVICES[@]}"; do
+                _svc_q=$(printf '%s' "$_svc" | sed "s/'/'\\\\''/g")
+                SYSCMDS="$SYSCMDS networksetup -setv6off '$_svc_q';"
+            done
+        fi
+    else
+        echo "⚠️  未能自动识别以太网或 Wi-Fi 网络服务,安装后请手动关闭对应网卡的 IPv6"
+    fi
     SYSCMDS="$SYSCMDS dscacheutil -flushcache; killall -HUP mDNSResponder"
     echo ""
     echo "接下来需要输入一次开机密码,用于: 安装守护进程(系统目录) + 锁定时区($TZV) + 关闭IPv6"

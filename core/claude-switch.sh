@@ -921,8 +921,351 @@ if __name__ == "__main__":
 PY_CLASH_RULES
 fi
 
+if [ "${1:-}" = "clash-party-ctl" ]; then
+    shift
+    exec "${CLAUDE_SWITCHER_PYTHON:-python3}" - "$@" <<'PY_CLASH_PARTY'
+"""Inspect Clash Party (Mihomo Party) runtime controller and manage optional controller override."""
+import http.client
+import ipaddress
+import json
+import os
+import re
+import socket
+import stat
+import sys
+import tempfile
+from pathlib import Path
+from urllib.parse import urlsplit
+
+
+DOMAINS = (
+    "claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com",
+    "challenges.cloudflare.com", "datadoghq.com", "segment.io", "stripe.com",
+    "stripe.network", "stripecdn.com", "intercom.io", "intercomcdn.com",
+    "intercomassets.com",
+)
+
+
+def fail(message):
+    print("FAIL:" + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read_text(path):
+    return path.read_bytes().decode("utf-8-sig", errors="replace")
+
+
+def read_yaml_scalar(path, key):
+    if not path.is_file():
+        return ""
+    match = re.search(r"^[ \t]*" + re.escape(key) + r":[ \t]*(.*)$", read_text(path), re.M)
+    if not match:
+        return ""
+    value = match.group(1).strip()
+    if value.startswith('"'):
+        try:
+            return str(json.JSONDecoder().raw_decode(value)[0])
+        except ValueError:
+            return ""
+    if value.startswith("'"):
+        m = re.fullmatch(r"'((?:[^']|'')*)'\s*(?:#.*)?", value)
+        return m.group(1).replace("''", "'") if m else ""
+    value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+    return "" if value in {"", "null", "~"} else value
+
+
+def parse_controller_spec(raw):
+    text = raw.strip()
+    if not text or any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        return None
+    if text.startswith("unix://"):
+        text = text[7:]
+    if text.startswith("/"):
+        if not os.path.isabs(text):
+            return None
+        return ("unix", text, None), text
+    if re.fullmatch(r"\d{1,5}", text):
+        text = "127.0.0.1:" + text
+    elif text.startswith("0.0.0.0:"):
+        text = "127.0.0.1:" + text[8:]
+    elif text.startswith("[::]:"):
+        text = "[::1]:" + text[5:]
+    elif text.startswith(":"):
+        text = "127.0.0.1" + text
+    url = text if text.startswith(("http://", "https://")) else ("http://" + text)
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if (parsed.scheme not in {"http", "https"} or not parsed.hostname or not parsed.port
+            or not (1 <= parsed.port <= 65535) or parsed.username or parsed.password
+            or parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
+        return None
+    host = parsed.hostname
+    if host != "localhost":
+        try:
+            if not ipaddress.ip_address(host).is_loopback:
+                return None
+        except ValueError:
+            return None
+    host_fmt = f"[{host}]" if ":" in host else host
+    stored = f"{host_fmt}:{parsed.port}" if parsed.scheme == "http" else f"{parsed.scheme}://{host_fmt}:{parsed.port}"
+    return (parsed.scheme, host, parsed.port), stored
+
+
+def override_file(base_dir):
+    return Path(base_dir) / "clash-party-controller.txt"
+
+
+def read_override(base_dir):
+    path = override_file(base_dir)
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def probe_unix_socket(candidate):
+    if not hasattr(socket, "AF_UNIX") or not os.path.isabs(candidate):
+        return False
+    try:
+        st = os.stat(candidate)
+    except OSError:
+        return False
+    if not stat.S_ISSOCK(st.st_mode):
+        return False
+    if hasattr(os, "getuid") and st.st_uid not in {os.getuid(), 0}:
+        return False
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(0.3)
+        sock.connect(candidate)
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def read_party_secret(party_dir):
+    for rel in ("mihomo.yaml", "work/config.yaml"):
+        secret = read_yaml_scalar(party_dir / rel, "secret")
+        if secret and "\r" not in secret and "\n" not in secret:
+            return secret
+    return ""
+
+
+def resolve_controller(party_dir, base_dir):
+    secret = read_party_secret(party_dir)
+    override = read_override(base_dir)
+    if override and override != "auto":
+        parsed = parse_controller_spec(override)
+        if not parsed:
+            return None, secret, "指定控制接口格式无效"
+        endpoint, _ = parsed
+        if endpoint[0] == "unix" and not probe_unix_socket(endpoint[1]):
+            return None, secret, "指定 Unix socket 不可连接"
+        return endpoint, secret, "override"
+
+    sock_dir = Path(os.environ.get("CLAUDE_SWITCHER_PARTY_SOCK_DIR", "/tmp"))
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    patterns = ([f"mihomo-party-{uid}-*.sock"] if uid is not None else []) + ["mihomo-party-*.sock"]
+    seen = set()
+    candidates = []
+    for pat in patterns:
+        for item in sock_dir.glob(pat):
+            full = str(item)
+            if full in seen:
+                continue
+            seen.add(full)
+            try:
+                mtime = item.stat().st_mtime
+            except OSError:
+                continue
+            candidates.append((mtime, full))
+    for _, candidate in sorted(candidates, reverse=True):
+        if probe_unix_socket(candidate):
+            return ("unix", candidate, None), secret, "ipc-socket"
+
+    for rel in ("mihomo.yaml", "work/config.yaml"):
+        cfg = party_dir / rel
+        unix_cfg = read_yaml_scalar(cfg, "external-controller-unix")
+        if unix_cfg and probe_unix_socket(unix_cfg):
+            return ("unix", unix_cfg, None), secret, rel
+        tcp_cfg = read_yaml_scalar(cfg, "external-controller")
+        if tcp_cfg:
+            parsed = parse_controller_spec(tcp_cfg)
+            if parsed:
+                return parsed[0], secret, rel
+
+    return None, secret, "未发现可用控制接口"
+
+
+def api_get(endpoint, secret, path):
+    headers = {"Accept": "application/json"}
+    if secret:
+        headers["Authorization"] = "Bearer " + secret
+    scheme, host, port = endpoint
+    conn = None
+    try:
+        if scheme == "unix":
+            conn = http.client.HTTPConnection("localhost", timeout=2)
+            conn.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            conn.sock.settimeout(2)
+            conn.sock.connect(host)
+        else:
+            cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+            conn = cls(host, port, timeout=2)
+        conn.request("GET", path, headers=headers)
+        resp = conn.getresponse()
+        if resp.status != 200:
+            raise OSError(f"HTTP {resp.status}")
+        raw = resp.read(4 * 1024 * 1024 + 1)
+        if len(raw) > 4 * 1024 * 1024:
+            raise ValueError("response too large")
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("invalid payload")
+        return data
+    finally:
+        if conn:
+            conn.close()
+
+
+def selected_leaf(proxies, name, seen=None):
+    seen = set() if seen is None else seen
+    if name in seen:
+        return None
+    seen.add(name)
+    item = proxies.get(name)
+    if not isinstance(item, dict):
+        return None
+    if "all" in item or "now" in item:
+        nxt = item.get("now")
+        if not nxt or nxt == name:
+            return None
+        return selected_leaf(proxies, nxt, seen)
+    return item
+
+
+def domain_rules_pinned(rules):
+    if not isinstance(rules, list):
+        return False
+    remaining = set(DOMAINS)
+    for item in rules:
+        if not isinstance(item, dict):
+            continue
+        if (item.get("extra") or {}).get("disabled") is True:
+            continue
+        rtype = str(item.get("type", "")).upper().replace("_", "-")
+        payload = str(item.get("payload", "")).strip().lower()
+        target = str(item.get("proxy", "")).strip()
+        if rtype in {"DOMAIN-SUFFIX", "DOMAINSUFFIX"} and payload in remaining:
+            if target.upper() in {"", "DIRECT", "REJECT", "REJECT-DROP", "PASS"}:
+                return False
+            remaining.discard(payload)
+            if not remaining:
+                return True
+            continue
+        if rtype == "MATCH" or target.upper() == "DIRECT":
+            if rtype in {"MATCH", "GEOIP", "GEOSITE", "RULE-SET"}:
+                break
+    return not remaining
+
+
+def main(args):
+    if not args:
+        fail("缺少参数")
+    action = args[0]
+    if action == "get" and len(args) == 2:
+        raw = read_override(args[1])
+        if raw and raw != "auto":
+            parsed = parse_controller_spec(raw)
+            if parsed:
+                print("controller=" + parsed[1])
+                return 0
+        print("controller=auto")
+        return 0
+    if action == "set" and len(args) == 3:
+        base = Path(args[1])
+        raw = args[2].strip()
+        path = override_file(base)
+        if not raw or raw == "auto":
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            print("OK:Clash Party 控制接口改为自动发现")
+            return 0
+        parsed = parse_controller_spec(raw)
+        if not parsed:
+            fail("只接受本机端口或绝对路径 Unix socket，例如 9090、127.0.0.1:9090 或 /tmp/mihomo-party-501-1234.sock")
+        _, stored = parsed
+        base.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, tmp = tempfile.mkstemp(prefix=".party-ctl-", dir=base)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(stored + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        print("OK:Clash Party 控制接口已设为 " + stored)
+        return 0
+    if action in {"mode", "rules-status"} and len(args) == 3:
+        party_dir, base_dir = Path(args[1]), Path(args[2])
+        endpoint, secret, source = resolve_controller(party_dir, base_dir)
+        override_set = bool(read_override(base_dir) and read_override(base_dir) != "auto")
+        if endpoint is None:
+            if action == "mode":
+                return 1
+            prefix = "override-unreachable" if override_set else "unverified"
+            print(f"{prefix}:{source}")
+            return 0
+        try:
+            configs = api_get(endpoint, secret, "/configs")
+            mode = str(configs.get("mode", "")).strip().lower()
+            if action == "mode":
+                if mode:
+                    print(mode)
+                    return 0
+                return 1
+            if mode == "global":
+                proxies = api_get(endpoint, secret, "/proxies").get("proxies", {})
+                leaf = selected_leaf(proxies, "GLOBAL") if isinstance(proxies, dict) else None
+                ltype = str((leaf or {}).get("type", "")).lower()
+                if not leaf or ltype in {"", "direct", "pass", "reject", "rejectdrop", "block"}:
+                    print("fail:全局模式但 GLOBAL 未选择有效代理节点")
+                else:
+                    print("ok:全局模式(全部流量走代理)")
+                return 0
+            if mode == "direct":
+                print("fail:Clash Party 当前处于直连(direct)模式")
+                return 0
+            if mode == "rule":
+                rules = api_get(endpoint, secret, "/rules").get("rules", [])
+                if domain_rules_pinned(rules):
+                    print(f"ok:内核规则已验证({len(DOMAINS)} 个生态域名已置顶)")
+                else:
+                    print("fallback:内核未见完整置顶规则")
+                return 0
+            print("unverified:未知运行模式")
+            return 0
+        except (http.client.HTTPException, OSError, ValueError) as exc:
+            if action == "mode":
+                return 1
+            prefix = "override-unreachable" if override_set else "unverified"
+            print(f"{prefix}:控制接口不可用({exc.__class__.__name__})")
+            return 0
+    fail("未知的 Clash Party 控制操作")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
+PY_CLASH_PARTY
+fi
+
 # ============ 安装时可配置项(安装程序会自动改写) ============
-PROXY_MODE="clash-verge"       # 代理客户端: clash-verge|flclash|bettbox|shadowrocket|sing-box|clashx|surge|auto
+PROXY_MODE="clash-verge"       # 代理客户端: clash-verge|clash-party|flclash|bettbox|shadowrocket|sing-box|clashx|surge|auto
 PROXY_GROUP="IpEqual"          # Clash 代理组名(安装时自动探测)
 COUNTRY_TARGET="US"            # 目标出口国家(安装时按出口自动识别)
 TZ_TARGET="America/New_York"   # 锁定时区,应与出口IP所在城市一致
@@ -933,6 +1276,7 @@ DATA="$HOME/Library/Application Support/Claude"
 BASE="$HOME/.claude-switcher"
 LOG="$HOME/Library/Logs/claude-switch.log"
 CLASH_DIR="$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
+CLASH_PARTY_DIR="$HOME/Library/Application Support/mihomo-party"
 ROUTE_MISSED=""
 KEEP_STAGED=0
 mkdir -p "$BASE/accounts"
@@ -977,6 +1321,7 @@ tun_up() { ifconfig 2>/dev/null | grep -q 'inet 198\.18\.'; }
 proxy_name() {
     case "$PROXY_MODE" in
         clash-verge)  echo "Clash Verge" ;;
+        clash-party)  echo "Clash Party" ;;
         flclash)      echo "FlClash" ;;
         bettbox)      echo "Bettbox" ;;
         shadowrocket) echo "Shadowrocket" ;;
@@ -992,6 +1337,12 @@ proxy_name() {
 proxy_app_name() {
     case "$PROXY_MODE" in
         clash-verge)  echo "Clash Verge" ;;
+        clash-party)
+            if [ -d "/Applications/Mihomo Party.app" ] && [ ! -d "/Applications/Clash Party.app" ]; then
+                echo "Mihomo Party"
+            else
+                echo "Clash Party"
+            fi ;;
         flclash)      echo "FlClash" ;;
         bettbox)      echo "Bettbox" ;;
         shadowrocket) echo "Shadowrocket" ;;
@@ -1020,23 +1371,68 @@ clashx_alive() {
         || pgrep -x 'ClashX Meta' >/dev/null 2>&1
 }
 
+# Clash Party(原 Mihomo Party)内核通过 sidecar/mihomo* 启动并挂载 /tmp/mihomo-party-*.sock;
+# 不匹配常驻 KeepAlive 的 party.mihomo.helper,避免客户端退出后误判在线。
+clash_party_alive() {
+    pgrep -f '/Contents/Resources/sidecar/mihomo' >/dev/null 2>&1 \
+        || pgrep -f '/tmp/mihomo-party-.*\.sock' >/dev/null 2>&1 \
+        || pgrep -f '/Application Support/mihomo-party/work' >/dev/null 2>&1
+}
+
 # 代理内核在线判定:按安装时识别的客户端分派;auto 时任一命中即活
 proxy_alive() {
     case "$PROXY_MODE" in
         clash-verge)  pgrep -f verge-mihomo >/dev/null 2>&1 ;;
+        clash-party)  clash_party_alive ;;
         flclash)      pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1 ;;
         bettbox)      pgrep -f BettboxCore >/dev/null 2>&1 || pgrep -x Bettbox >/dev/null 2>&1 ;;
         shadowrocket) shadowrocket_up ;;
         sing-box)     pgrep -f sing-box >/dev/null 2>&1 ;;
         clashx)       clashx_alive ;;
         surge)        pgrep -f Surge >/dev/null 2>&1 ;;
-        auto)         pgrep -f verge-mihomo >/dev/null 2>&1 || shadowrocket_up \
+        auto)         pgrep -f verge-mihomo >/dev/null 2>&1 || clash_party_alive || shadowrocket_up \
                       || pgrep -f sing-box >/dev/null 2>&1 \
                       || pgrep -f FlClashCore >/dev/null 2>&1 || pgrep -x FlClash >/dev/null 2>&1 \
                       || pgrep -f BettboxCore >/dev/null 2>&1 || pgrep -x Bettbox >/dev/null 2>&1 \
                       || clashx_alive \
                       || pgrep -f Surge >/dev/null 2>&1 ;;
         *)            pgrep -f verge-mihomo >/dev/null 2>&1 ;;
+    esac
+}
+
+# Clash Party 控制接口与置顶规则探测:优先 IPC socket/配置端口核验模式与规则,不可达时回退 Fake-IP 行为检测
+clash_party_ctl() {
+    "${BASH:-/bin/bash}" "$0" clash-party-ctl "$@"
+}
+clash_party_mode() {
+    clash_party_ctl mode "$CLASH_PARTY_DIR" "$BASE" 2>/dev/null
+}
+clash_party_rules_status() {
+    local status detail
+    status=$(clash_party_ctl rules-status "$CLASH_PARTY_DIR" "$BASE" 2>/dev/null || true)
+    case "$status" in
+        ok:*|fail:*)
+            echo "$status"
+            return 0 ;;
+        fallback:*)
+            if route_ok; then
+                echo "ok:行为检测通过(${status#fallback:},建议在覆写中置顶全部生态域名)"
+            else
+                echo "fail:未命中(${ROUTE_MISSED# }),请在 Clash Party 覆写中添加 DOMAIN-SUFFIX 置顶规则"
+            fi
+            return 0 ;;
+        override-unreachable:*)
+            detail="${status#override-unreachable:}"
+            echo "fail:指定的 Clash Party 控制接口不可达(${detail})"
+            return 0 ;;
+        *)
+            detail="${status#unverified:}"
+            if route_ok; then
+                echo "ok:行为检测通过(控制接口未验证${detail:+:$detail})"
+            else
+                echo "fail:未命中(${ROUTE_MISSED# }),请在 Clash Party 中启用 Fake-IP 并添加置顶规则"
+            fi
+            return 0 ;;
     esac
 }
 
@@ -1306,6 +1702,93 @@ iphist_count() {
     awk '{print $1}' "$HIST" | sort -u | wc -l | tr -d ' '
 }
 
+# 识别常见有线/无线主网络服务(排除默认启用但未插线的桥接/蓝牙/移动热点等伪服务)
+_ipv6_is_lan_wlan_service() {
+    case "$1" in
+        *"Thunderbolt Bridge"*|*"Bluetooth"*|*"FireWire"*|*"iPhone"*|*"iPad"*) return 1 ;;
+        *Wi-Fi*|*AirPort*|*Ethernet*|*LAN*|*"以太网"*|*"局域网"*|*"无线局域网"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 扫描 macOS 网络服务的 IPv6 状态(检查、修复与安装器保持一致):
+# 优先取当前实际活跃(已分配 IPv4/Router/非 none 的 IPv6)的服务,兼容仅以太网 Mac 与双连接场景;
+# 无活跃连接时回退已启用的以太网/Wi-Fi 服务;完全查不到服务时返回非零以保持 Fail-Closed。
+_ipv6_scan() {
+    _IPV6_SCAN_STATE=""
+    _IPV6_OPEN_SERVICES=()
+    local raw_list line info v6_line ip4 router4 ip6 is_active is_off joined s
+    local active_all=() active_on=() active_off=()
+    local fallback_all=() fallback_on=() fallback_off=()
+    local chosen_on=() chosen_off=()
+    raw_list=$(networksetup -listallnetworkservices 2>/dev/null || true)
+    if printf '%s\n' "$raw_list" | grep -qi '^IPv6:'; then
+        if printf '%s\n' "$raw_list" | grep -qi '^IPv6:[[:space:]]*off'; then
+            _IPV6_SCAN_STATE="ok:已关闭"
+            return 0
+        fi
+        _IPV6_SCAN_STATE="fail:未关闭"
+        _IPV6_OPEN_SERVICES=("Wi-Fi")
+        return 0
+    fi
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        case "$line" in
+            ''|'An asterisk ('*|'*'*|'** Error:'*) continue ;;
+        esac
+        info=$(networksetup -getinfo "$line" 2>/dev/null || true)
+        v6_line=$(printf '%s\n' "$info" | grep -i '^IPv6:' | head -n 1)
+        [ -n "$v6_line" ] || continue
+        ip4=$(printf '%s\n' "$info" | sed -n 's/^IP address:[[:space:]]*//p' | head -n 1)
+        router4=$(printf '%s\n' "$info" | sed -n 's/^Router:[[:space:]]*//p' | head -n 1)
+        ip6=$(printf '%s\n' "$info" | sed -n 's/^IPv6 IP address:[[:space:]]*//p' | head -n 1)
+        is_active=0; is_off=0
+        if { [ -n "$ip4" ] && [ "$ip4" != "none" ] && [ "$ip4" != "(null)" ]; } \
+            || { [ -n "$router4" ] && [ "$router4" != "none" ] && [ "$router4" != "(null)" ]; } \
+            || { [ -n "$ip6" ] && [ "$ip6" != "none" ] && [ "$ip6" != "(null)" ]; }; then
+            is_active=1
+        fi
+        if printf '%s\n' "$v6_line" | grep -qi '^IPv6:[[:space:]]*off'; then
+            is_off=1
+        fi
+        if [ "$is_active" -eq 1 ]; then
+            active_all+=("$line")
+            if [ "$is_off" -eq 1 ]; then active_off+=("$line"); else active_on+=("$line"); fi
+        fi
+        if _ipv6_is_lan_wlan_service "$line"; then
+            fallback_all+=("$line")
+            if [ "$is_off" -eq 1 ]; then fallback_off+=("$line"); else fallback_on+=("$line"); fi
+        fi
+    done <<< "$raw_list"
+
+    if [ "${#active_all[@]}" -gt 0 ]; then
+        [ "${#active_on[@]}" -gt 0 ] && chosen_on=("${active_on[@]}")
+        [ "${#active_off[@]}" -gt 0 ] && chosen_off=("${active_off[@]}")
+    elif [ "${#fallback_all[@]}" -gt 0 ]; then
+        [ "${#fallback_on[@]}" -gt 0 ] && chosen_on=("${fallback_on[@]}")
+        [ "${#fallback_off[@]}" -gt 0 ] && chosen_off=("${fallback_off[@]}")
+    else
+        _IPV6_SCAN_STATE="fail:无法判断(未识别到网络服务)"
+        return 1
+    fi
+
+    joined=""
+    if [ "${#chosen_on[@]}" -gt 0 ]; then
+        _IPV6_OPEN_SERVICES=("${chosen_on[@]}")
+        for s in "${chosen_on[@]}"; do joined="${joined:+$joined, }$s"; done
+        _IPV6_SCAN_STATE="fail:未关闭($joined)"
+        return 0
+    fi
+    for s in "${chosen_off[@]}"; do joined="${joined:+$joined, }$s"; done
+    _IPV6_SCAN_STATE="ok:已关闭($joined)"
+    return 0
+}
+
+ipv6_status() {
+    _ipv6_scan >/dev/null 2>&1 || true
+    echo "${_IPV6_SCAN_STATE:-fail:无法判断(未识别到网络服务)}"
+}
+
 # ---------- 安全检查 ----------
 check() {
     load_check_config || { echo "FAIL:检查配置无效，请恢复默认设置"; return 1; }
@@ -1339,8 +1822,17 @@ check() {
     locale=$(defaults read -g AppleLocale 2>/dev/null)
     [ "$locale" = "$LOCALE_TARGET" ] || fails="$fails;地区异常($locale)"
 
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
-    echo "$v6" | grep -qi 'off' || fails="$fails;IPv6未关闭"
+    if declare -F ipv6_status >/dev/null 2>&1; then
+        v6_state=$(ipv6_status)
+        case "$v6_state" in
+            ok:*) ;;
+            fail:*) fails="$fails;IPv6:${v6_state#fail:}" ;;
+            *) fails="$fails;IPv6:无法判断" ;;
+        esac
+    else
+        v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
+        echo "$v6" | grep -qi 'off' || fails="$fails;IPv6未关闭"
+    fi
 
     if ! check_disabled "DNS"; then
         dnsip=$(dig +short +time=3 +tries=1 claude.ai 2>/dev/null | head -1)
@@ -1362,9 +1854,16 @@ check() {
         *) fails="$fails;保镖:状态无法验证" ;;
     esac
 
-    # 置顶规则:Clash Verge 验证运行内核;全局模式下全部流量走代理,规则不适用;其他客户端只看行为检测
+    # 置顶规则:Clash Verge 验证运行内核;Clash Party 优先查内核模式/规则并回退行为检测;其他客户端看行为检测
     if [ "$PROXY_MODE" = "clash-verge" ]; then
         [ "$(clash_mode)" = "global" ] || merge_ok || fails="$fails;运行中置顶规则未验证"
+    elif [ "$PROXY_MODE" = "clash-party" ]; then
+        cp_rule=$(clash_party_rules_status)
+        case "$cp_rule" in
+            ok:*) ;;
+            fail:*) fails="$fails;置顶规则:${cp_rule#fail:}" ;;
+            *) fails="$fails;置顶规则:状态无法验证" ;;
+        esac
     else
         route_ok || fails="$fails;置顶规则缺失(未命中:${ROUTE_MISSED# })"
     fi
@@ -1398,8 +1897,12 @@ webrtc_test() {
 # 日常检查与修复共用此判断。先确认规则，再允许探测，避免向已知直连路径发包。
 webrtc_status() {
     local verified result probe_rc assessment mode leak wips w
-    if [ "$PROXY_MODE" = "clash-verge" ]; then
-        mode=$(clash_mode)
+    if [ "$PROXY_MODE" = "clash-verge" ] || [ "$PROXY_MODE" = "clash-party" ]; then
+        if [ "$PROXY_MODE" = "clash-verge" ]; then
+            mode=$(clash_mode)
+        else
+            mode=$(clash_party_mode || true)
+        fi
         # 全局模式不经过规则匹配,直接按"STUN 结果是否等于当前出口"判断
         if [ "$mode" = "global" ]; then
             result=$(webrtc_test)
@@ -1422,9 +1925,15 @@ webrtc_status() {
             esac
             return
         fi
-        if ! verified=$(clash_rules verify 2>&1); then
-            echo "fail:运行规则未验证:${verified#FAIL:}"
+        if [ "$mode" = "direct" ]; then
+            echo "fail:Clash Party 当前处于直连(direct)模式，未发送 STUN 探测"
             return
+        fi
+        if [ "$PROXY_MODE" = "clash-verge" ]; then
+            if ! verified=$(clash_rules verify 2>&1); then
+                echo "fail:运行规则未验证:${verified#FAIL:}"
+                return
+            fi
         fi
     fi
     result=$(webrtc_test)
@@ -1519,8 +2028,7 @@ checkdetail() {
     if [ "$tz" = "/var/db/timezone/zoneinfo/$TZ_TARGET" ]; then echo '时区=ok'; else echo "时区=fail:$tz"; fi
     locale=$(defaults read -g AppleLocale 2>/dev/null)
     if [ "$locale" = "$LOCALE_TARGET" ]; then echo '地区=ok'; else echo "地区=fail:$locale"; fi
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
-    if echo "$v6" | grep -qi 'off'; then echo 'IPv6=ok:已关闭'; else echo 'IPv6=fail:未关闭'; fi
+    echo "IPv6=$(ipv6_status)"
     if check_disabled "DNS"; then
         optional_result "DNS" ok
     else
@@ -1539,7 +2047,7 @@ checkdetail() {
         optional_result "WebRTC" "$wrst" "$wrdt"
     fi
     echo "保镖=$(bodyguard_status)"
-    # 置顶规则:Clash Verge 验证运行内核;全局模式下规则不适用(全部流量已走代理)
+    # 置顶规则:Clash Verge 验证运行内核;Clash Party 查控制接口并回退行为检测;其他客户端看行为检测
     if [ "$PROXY_MODE" = "clash-verge" ]; then
         if [ "$(clash_mode)" = "global" ]; then
             echo '规则置顶=ok:全局模式(全部流量走代理)'
@@ -1548,6 +2056,8 @@ checkdetail() {
         else
             echo '规则置顶=fail:未生效'
         fi
+    elif [ "$PROXY_MODE" = "clash-party" ]; then
+        echo "规则置顶=$(clash_party_rules_status)"
     else
         if route_ok; then
             echo '规则置顶=ok:行为检测通过'
@@ -1725,11 +2235,25 @@ fix() {
     fi
 
     # B. 时区/IPv6/DNS缓存/保镖(需管理员权限,会弹一次密码框)
+    local fix_failed=0 v6_scan_ok=1 v6_svc v6_sq v6_as
     tz=$(readlink /etc/localtime 2>/dev/null)
-    v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
     adminCmds=""
     [ "$tz" != "/var/db/timezone/zoneinfo/$TZ_TARGET" ] && adminCmds="${adminCmds}/usr/sbin/systemsetup -settimezone $TZ_TARGET; "
-    echo "$v6" | grep -qi 'off' || adminCmds="${adminCmds}networksetup -setv6off Wi-Fi; "
+    if declare -F _ipv6_scan >/dev/null 2>&1; then
+        _ipv6_scan || v6_scan_ok=0
+        if [ "$v6_scan_ok" -eq 1 ] && [ "${#_IPV6_OPEN_SERVICES[@]}" -gt 0 ]; then
+            for v6_svc in "${_IPV6_OPEN_SERVICES[@]}"; do
+                case "$v6_svc" in *[$'\r\n']*) continue ;; esac
+                v6_sq="'${v6_svc//\'/\'\\\'\'}'"
+                v6_as="${v6_sq//\\/\\\\}"
+                v6_as="${v6_as//\"/\\\"}"
+                adminCmds="${adminCmds}networksetup -setv6off $v6_as; "
+            done
+        fi
+    else
+        v6=$(networksetup -getinfo Wi-Fi 2>/dev/null | grep -i '^IPv6:')
+        echo "$v6" | grep -qi 'off' || adminCmds="${adminCmds}networksetup -setv6off Wi-Fi; "
+    fi
     if ! launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
         adminCmds="${adminCmds}cp -X $HOME/.local/bin/local.claude-bodyguard.plist /Library/LaunchDaemons/ || exit 1; /usr/bin/xattr -d com.apple.quarantine /Library/LaunchDaemons/local.claude-bodyguard.plist 2>/dev/null || true; chown root:wheel /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; chmod 644 /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl bootstrap system /Library/LaunchDaemons/local.claude-bodyguard.plist || exit 1; launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || exit 1; "
     fi
@@ -1746,6 +2270,10 @@ ASEOF
         fi
     else
         echo "FIX:时区/IPv6/保镖 无需修复 ✓"
+    fi
+    if [ "$v6_scan_ok" -eq 0 ]; then
+        echo "FIX:IPv6 ✗ 未识别到以太网或 Wi-Fi 网络服务,无法自动关闭 IPv6"
+        fix_failed=1
     fi
 
     # B3. Claude 客户端单独设英文(用户级,无需密码;系统首选语言已是英文则跳过)
@@ -1787,12 +2315,18 @@ ASEOF
             return 1
         fi
         echo "FIX:置顶规则 ✓ 已验证内核实际加载"
+    elif [ "$PROXY_MODE" = "clash-party" ]; then
+        local cp_fix_rule
+        cp_fix_rule=$(clash_party_rules_status)
+        case "$cp_fix_rule" in
+            ok:*) echo "FIX:置顶规则 ✓ (${cp_fix_rule#ok:})" ;;
+            *) echo "FIX:置顶规则 ✗ ${cp_fix_rule#fail:}" ;;
+        esac
     elif [ "$PROXY_MODE" != "flclash" ] && ! route_ok; then
         echo "FIX:置顶规则 ✗ 请在 $(proxy_name) 中自行添加 DOMAIN-SUFFIX 置顶规则"
     fi
 
     # C. 复测与日常审计共用判断，空结果、非零退出及无响应不会冒充代理成功。
-    local fix_failed=0
     wrip=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | cut -d= -f2)
     wr=$(webrtc_status "$wrip")
     case "$wr" in
@@ -1818,8 +2352,8 @@ ASEOF
 set_client() {
     mode="${1:-}"
     case "$mode" in
-        clash-verge|flclash|bettbox|shadowrocket|sing-box|clashx|surge|auto) ;;
-        *) echo "FAIL:用法: claude-switch.sh set-client <clash-verge|flclash|bettbox|shadowrocket|sing-box|clashx|surge|auto>"; return 1 ;;
+        clash-verge|clash-party|flclash|bettbox|shadowrocket|sing-box|clashx|surge|auto) ;;
+        *) echo "FAIL:用法: claude-switch.sh set-client <clash-verge|clash-party|flclash|bettbox|shadowrocket|sing-box|clashx|surge|auto>"; return 1 ;;
     esac
     target="${CLAUDE_SWITCHER_CORE:-}"
     if [ -z "$target" ]; then
@@ -1846,7 +2380,7 @@ set_client() {
 # 只读输出当前代理客户端(供 UI 下拉高亮),同时列出全部支持项
 get_client() {
     echo "client=$PROXY_MODE"
-    echo "clients=clash-verge,flclash,bettbox,shadowrocket,sing-box,clashx,surge"
+    echo "clients=clash-verge,clash-party,flclash,bettbox,shadowrocket,sing-box,clashx,surge"
 }
 
 # 地区自适应:按当前出口国家一键重设 国家/时区/地区格式(换了国家节点后运行)
@@ -2682,6 +3216,8 @@ case "$operation" in
     set-region) set_region ;;
     set-client) set_client "${2:-}" ;;
     get-client) get_client ;;
+    get-clash-party-controller) clash_party_ctl get "$BASE" ;;
+    set-clash-party-controller) clash_party_ctl set "$BASE" "${2:-}" ;;
     update) self_update "${2:-}" ;;
     update-check) self_update --check ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
     open-safe) open_safe "${2:-}" ;;
@@ -2696,7 +3232,7 @@ case "$operation" in
     set-check-config) "$0" _support config-set "${2:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli [args...]|cli-current|quit-claude|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|get-clash-party-controller|set-clash-party-controller <port|addr|sock|auto>|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|cli [args...]|cli-current|quit-claude|export-diagnostics <file>|get-check-config|set-check-config <json>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac
 # checkdetail 分支内部已保存返回码;其他分支取 case 的最终状态。
 # 判断本身会改变 $?，所以必须先捕获 dispatch_rc，再按操作类型落 rc。
@@ -2705,7 +3241,7 @@ if [ "$operation" != "checkdetail" ]; then
     rc=$dispatch_rc
 fi
 case "$operation" in
-    get-check-config|set-check-config|export-diagnostics) ;;
+    get-check-config|set-check-config|export-diagnostics|get-clash-party-controller|set-clash-party-controller) ;;
     *) log_result "$started_at" "$operation" "$rc" "$summary" ;;
 esac
 exit "$rc"
